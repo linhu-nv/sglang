@@ -134,6 +134,8 @@ class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
         # until FlexKV signals completion, draining in ``evict`` /
         # ``check_hicache_events``.
         self._inflight_store_nodes: dict[str, TreeNode] = {}
+        self._inflight_decode_offloads: set[str] = set()
+        self._completed_decode_offloads: set[str] = set()
         self._node_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -147,6 +149,8 @@ class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
         if hasattr(self, "_inflight_store_nodes"):
             with self._node_lock:
                 self._inflight_store_nodes.clear()
+                self._inflight_decode_offloads.clear()
+                self._completed_decode_offloads.clear()
         if hasattr(self, "flexkv_connector"):
             self.flexkv_connector.reset()
 
@@ -400,6 +404,46 @@ class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
     # cache_finished_req (STORE)
     # ------------------------------------------------------------------
 
+    def create_decode_offload_manager(
+        self,
+        *,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+        tp_group,
+        server_args,
+    ):
+        from sglang.srt.mem_cache.storage.flexkv.decode_offload_manager import (
+            FlexKVDecodeKVCacheOffloadManager,
+        )
+
+        return FlexKVDecodeKVCacheOffloadManager(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=self,
+            server_args=server_args,
+        )
+
+    def store_decode_offload(
+        self, store_id: str, token_ids, kv_indices: torch.Tensor
+    ) -> bool:
+        fkv_task_id = self.flexkv_connector.store_kv(
+            rid=store_id,
+            token_ids=list(token_ids),
+            kv_indices=kv_indices,
+        )
+        if fkv_task_id < 0:
+            return False
+        with self._node_lock:
+            self._inflight_decode_offloads.add(store_id)
+        return True
+
+    def pop_completed_decode_offloads(self) -> list[str]:
+        self._drain_completed_stores()
+        with self._node_lock:
+            completed = list(self._completed_decode_offloads)
+            self._completed_decode_offloads.clear()
+        return completed
+
     def cache_finished_req(  # type: ignore[override]
         self, req: Req, is_insert: bool = True
     ) -> None:
@@ -489,6 +533,10 @@ class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
             return
         with self._node_lock:
             for rid in completed_rids:
+                if rid in self._inflight_decode_offloads:
+                    self._inflight_decode_offloads.remove(rid)
+                    self._completed_decode_offloads.add(rid)
+                    continue
                 node = self._inflight_store_nodes.pop(rid, None)
                 if node is not None:
                     self.dec_lock_ref(node)
@@ -502,6 +550,12 @@ class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
         self._load_markers.pop(rid, None)
         with self._node_lock:
             node = self._inflight_store_nodes.pop(rid, None)
+            for store_id in list(self._inflight_decode_offloads):
+                if store_id.startswith(f"{rid}:decode_offload:"):
+                    self._inflight_decode_offloads.remove(store_id)
+            for store_id in list(self._completed_decode_offloads):
+                if store_id.startswith(f"{rid}:decode_offload:"):
+                    self._completed_decode_offloads.remove(store_id)
         if node is not None:
             self.dec_lock_ref(node)
         self.flexkv_connector.release_pending(rid)

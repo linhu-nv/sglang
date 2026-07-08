@@ -6160,9 +6160,12 @@ class ServerArgs:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
                 )
-            if self.hicache_storage_backend is None:
+            is_flexkv_cache = (
+                self.enable_flexkv or self.radix_cache_backend == "flexkv"
+            )
+            if self.hicache_storage_backend is None and not is_flexkv_cache:
                 raise ValueError(
-                    "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                    "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided or FlexKV is enabled."
                 )
 
         # Validate the effective ratio: model branches may declare a reset
