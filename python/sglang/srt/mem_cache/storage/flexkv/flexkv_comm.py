@@ -120,12 +120,19 @@ class FlexKVComm:
         )
 
         self.pp_size = model_config.pp_size
-        self.attn_tp_size = model_config.attn_tp_size
-        self.attn_cp_size = model_config.attn_cp_size
+        # FlexKV releases before the SGLang attn-tp naming split expose these
+        # fields as tp/cp. Keep both spellings so connector startup is not tied
+        # to one FlexKV package version.
+        self.attn_tp_size = getattr(
+            model_config, "attn_tp_size", model_config.tp_size
+        )
+        self.attn_cp_size = getattr(
+            model_config, "attn_cp_size", model_config.cp_size
+        )
 
         self.pp_rank = rank_info.pp_rank
-        self.attn_tp_rank = rank_info.attn_tp_rank
-        self.attn_cp_rank = rank_info.attn_cp_rank
+        self.attn_tp_rank = getattr(rank_info, "attn_tp_rank", rank_info.tp_rank)
+        self.attn_cp_rank = getattr(rank_info, "attn_cp_rank", rank_info.cp_rank)
 
         self.is_pp_stage_leader = self.attn_tp_rank == 0 and self.attn_cp_rank == 0
         self.is_sync_leader = self.pp_rank == 0 and self.is_pp_stage_leader
