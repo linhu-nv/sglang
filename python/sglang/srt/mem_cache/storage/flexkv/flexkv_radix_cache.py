@@ -9,7 +9,10 @@ contract is identical:
 * MP (synchronous) mode — the default.
   ``match_prefix`` fires only a FlexKV LOOKUP and returns ``host_hit_length``;
   the scheduler then calls :meth:`init_load_back` at dispatch time which
-  allocates slots and fires the FlexKV RETRIEVE.
+  allocates slots and fires the FlexKV RETRIEVE. On a PD decode node,
+  ``match_prefix`` performs that RETRIEVE immediately and returns the
+  restored tokens as a normal device prefix, matching decode's existing
+  radix-cache contract.
 
 * IP (layerwise) mode — enabled with ``FLEXKV_ENABLE_LAYERWISE_TRANSFER=1``.
   ``match_prefix`` allocates uncached slots and kicks off a layerwise
@@ -41,6 +44,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.storage.flexkv.decode_flexkv_mixin import (
+    DecodeFlexKVMixin,
+)
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
 
 if TYPE_CHECKING:
@@ -68,7 +74,7 @@ class _LoadBackMarker:
     value_numel: int  # device tokens already present at lookup time
 
 
-class FlexKVRadixCache(RadixCache):
+class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
     """RadixCache extended with FlexKV host-tier IO."""
 
     def __init__(
@@ -111,6 +117,7 @@ class FlexKVRadixCache(RadixCache):
         self._mode = (
             FlexKVMode.IP if self.flexkv_connector.enable_layerwise else FlexKVMode.MP
         )
+        self._init_decode_flexkv(server_args)
         if self._mode is FlexKVMode.IP:
             # Register the eventfd counter onto sglang's KV pool so each
             # forward layer blocks on its own eventfd.
@@ -191,8 +198,13 @@ class FlexKVRadixCache(RadixCache):
         last_node: TreeNode,
         req: Req,
     ) -> MatchResult:
-        """LOOKUP-only path. Sets ``host_hit_length`` on the result so
-        the scheduler later invokes :meth:`init_load_back`."""
+        """MP path.
+
+        Normal scheduler flow is LOOKUP-only: report ``host_hit_length`` so
+        scheduling can call :meth:`init_load_back`. PD decode already has a
+        prefill worker sending only the uncached suffix, so decode must restore
+        FlexKV hits before returning the match.
+        """
         token_ids = key.raw_token_ids()
         device_len = int(device_value.numel())
         if device_len >= len(token_ids):
@@ -208,6 +220,16 @@ class FlexKVRadixCache(RadixCache):
         )
         if hit <= 0:
             return base_res
+
+        if self._pd_decode_mode:
+            return self._decode_flexkv_match_prefix(
+                key=key,
+                base_res=base_res,
+                device_value=device_value,
+                last_node=last_node,
+                req=req,
+                hit=hit,
+            )
 
         # Snapshot the matched key (the live key aliases ``req.fill_ids``).
         if token_ids is key.token_ids:
