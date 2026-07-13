@@ -32,6 +32,27 @@ logger = logging.getLogger(__name__)
 class DecodeKVCacheOffloadManager:
     """Manage decode-side KV cache offloading lifecycle and operations."""
 
+    def __new__(
+        cls,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        tp_group: torch.distributed.ProcessGroup,
+        tree_cache: BasePrefixCache,
+        server_args: ServerArgs,
+    ):
+        if cls is DecodeKVCacheOffloadManager:
+            create_decode_offload_manager = getattr(
+                tree_cache, "create_decode_offload_manager", None
+            )
+            if callable(create_decode_offload_manager):
+                return create_decode_offload_manager(
+                    req_to_token_pool=req_to_token_pool,
+                    token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                    tp_group=tp_group,
+                    server_args=server_args,
+                )
+        return super().__new__(cls)
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,

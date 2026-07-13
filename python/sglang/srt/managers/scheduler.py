@@ -468,29 +468,17 @@ class Scheduler(
             self.server_args.disaggregation_mode == "decode"
             and self.server_args.disaggregation_decode_enable_offload_kvcache
         ):
-            tp_group = (
-                self.attn_tp_cpu_group
-                if self.server_args.enable_dp_attention
-                else self.tp_cpu_group
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
             )
-            create_decode_offload_manager = getattr(
-                self.tree_cache, "create_decode_offload_manager", None
-            )
-            if callable(create_decode_offload_manager):
-                self.decode_offload_manager = create_decode_offload_manager(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_group=tp_group,
-                    server_args=self.server_args,
-                )
-            else:
-                self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_group=tp_group,
-                    tree_cache=self.tree_cache,
-                    server_args=self.server_args,
-                )
         else:
             self.decode_offload_manager = None
 
