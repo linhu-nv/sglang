@@ -52,6 +52,12 @@ try:
     from flexkv.server.client import KVTPClient
     from flexkv.transfer.layerwise import build_layerwise_eventfd_socket_path
     from flexkv.transfer_manager import TransferManagerOnRemote
+
+    from sglang.srt.mem_cache.storage.flexkv.dsv4_adapter import (
+        is_dsv4_kv_pool,
+        prepare_dsv4_registration,
+        translate_dsv4_swa_slot_mapping,
+    )
 except ImportError as exc:  # pragma: no cover - runtime check
     raise RuntimeError(
         "FlexKV is not installed. Please install the FlexKV package to use "
@@ -122,7 +128,35 @@ class FlexKVConnector:
             attn_cp_group=attn_cp_group,
         )
 
-        # 3. Align block counts across all ranks (MIN reduce) so each
+        # 3. Describe the GPU pools before KVManager starts. DSV4 discovers
+        # heterogeneous c4/c128/indexer groups only after SGLang has allocated
+        # its device pools; FlexKV needs that geometry before sizing host tiers.
+        self._kvcache = kvcache
+        self._dsv4_registration = None
+        if is_dsv4_kv_pool(kvcache):
+            self._dsv4_registration = prepare_dsv4_registration(
+                kvcache=kvcache,
+                model_config=self.model_config,
+                cache_config=self.cache_config,
+            )
+            kv_caches = self._dsv4_registration.kv_caches
+            indexer_buffers = None
+        else:
+            indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+            if hasattr(kvcache, "kv_buffer"):
+                # MLA: K and V share the same buffer (per-layer tensor).
+                kv_caches = list(kvcache.kv_buffer)
+            elif hasattr(kvcache, "k_buffer"):
+                # MHA: K buffers concatenated with V buffers, layer-first.
+                kv_caches = list(kvcache.k_buffer) + list(kvcache.v_buffer)
+            else:
+                raise AttributeError(
+                    f"Unsupported KV cache type {type(kvcache).__name__}: "
+                    "expected DSV4 split pools, kv_buffer (MLA/NSA), or "
+                    "k_buffer/v_buffer (MHA)."
+                )
+
+        # 4. Align block counts across all ranks (MIN reduce) so each
         # rank's KVManager registers compatible sizes.
         for attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
             orig = getattr(self.cache_config, attr, None)
@@ -137,21 +171,6 @@ class FlexKVConnector:
                     aligned,
                 )
             setattr(self.cache_config, attr, aligned)
-
-        # 4. Extract MLA/MHA KV buffers + optional indexer buffers.
-        indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
-        if hasattr(kvcache, "kv_buffer"):
-            # MLA: K and V share the same buffer (per-layer tensor).
-            kv_caches = list(kvcache.kv_buffer)
-        elif hasattr(kvcache, "k_buffer"):
-            # MHA: K buffers concatenated with V buffers, layer-first.
-            kv_caches = list(kvcache.k_buffer) + list(kvcache.v_buffer)
-        else:
-            raise AttributeError(
-                f"Unsupported KV cache type {type(kvcache).__name__}: "
-                f"expected kv_buffer (MLA/NSA) or k_buffer/v_buffer (MHA)."
-            )
-        self._kvcache = kvcache
 
         # 5. On multi-node setups, every node beyond node 0 needs a
         # TransferManagerOnRemote process (FlexKV side) before any rank
@@ -273,7 +292,11 @@ class FlexKVConnector:
             tids_np = np.asarray(token_ids, dtype=np.int64)
             mask_np = self._as_numpy_mask(token_mask)
             try:
-                res = self.kv_manager.get_match(token_ids=tids_np, token_mask=mask_np)
+                res = self.kv_manager.get_match(
+                    token_ids=tids_np,
+                    token_mask=mask_np,
+                    swa_aware=self._dsv4_registration is not None,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] get_match raised: %s", exc)
                 res = None
@@ -349,9 +372,13 @@ class FlexKVConnector:
 
         n = slot_mapping_cpu.numel()
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            swa_mapping = self._get_dsv4_swa_slot_mapping(slot_mapping)
             self.kv_manager.launch(
                 task_ids=[fkv_task_id],
                 slot_mappings=[slot_mapping_cpu],
+                swa_slot_mappings=(
+                    [swa_mapping] if swa_mapping is not None else None
+                ),
                 as_batch=True,
                 layerwise_transfer=False,
             )
@@ -419,9 +446,13 @@ class FlexKVConnector:
             )
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            swa_mapping = self._get_dsv4_swa_slot_mapping(slot_mapping)
             self.kv_manager.launch(
                 task_ids=[fkv_task_id],
                 slot_mappings=[slot_mapping_cpu],
+                swa_slot_mappings=(
+                    [swa_mapping] if swa_mapping is not None else None
+                ),
                 as_batch=True,
                 layerwise_transfer=True,
                 counter_id=producer_id,
@@ -502,9 +533,13 @@ class FlexKVConnector:
             if int(unmatched_mask.sum()) > 0:
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping_cpu = self._to_cpu_int64(filtered)
+                swa_mapping = self._get_dsv4_swa_slot_mapping(filtered)
                 self.kv_manager.launch(
                     task_ids=[fkv_task_id],
                     slot_mappings=[slot_mapping_cpu],
+                    swa_slot_mappings=(
+                        [swa_mapping] if swa_mapping is not None else None
+                    ),
                     as_batch=False,
                     layerwise_transfer=False,
                 )
@@ -727,6 +762,13 @@ class FlexKVConnector:
             tensor = tensor.cpu()
         return tensor.to(torch.int64)
 
+    def _get_dsv4_swa_slot_mapping(
+        self, slot_mapping: torch.Tensor
+    ) -> Optional[np.ndarray]:
+        if self._dsv4_registration is None:
+            return None
+        return translate_dsv4_swa_slot_mapping(self._kvcache, slot_mapping)
+
     def _wait_kv_manager_ready(self, poll_interval: float = 10.0) -> None:
         assert self.kv_manager is not None
         wait_count = 0
@@ -771,6 +813,13 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_buffers: Optional[List[torch.Tensor]] = None,
     ) -> None:
+        if self._dsv4_registration is not None:
+            self.tp_client.register_to_server(
+                **self._dsv4_registration.register_kwargs()
+            )
+            logger.info("[FlexKV] Registered DSV4 GPU/SWA pools %s", self._label)
+            return
+
         assert len(kv_caches) > 0
         assert (
             kv_caches[0].ndim == 3
@@ -806,12 +855,13 @@ class FlexKVConnector:
                 is_mla=True,
             )
 
-        self.tp_client.register_to_server(
-            kv_caches=kv_caches,
-            kv_layout=gpu_layout,
-            indexer_buffers=indexer_buffers,
-            indexer_layout=indexer_layout,
-        )
+        if indexer_layout is not None:
+            raise NotImplementedError(
+                "FlexKV dpskv4_refactor removed the legacy indexer registration "
+                "arguments; standalone NSA indexers must be registered as a "
+                "heterogeneous layer group"
+            )
+        self.tp_client.register_to_server(kv_caches=kv_caches, kv_layout=gpu_layout)
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
 
     def _send_pp_put_meta(self, fkv_task_id: int, unmatched_mask) -> None:

@@ -18,11 +18,12 @@ exercised. Adjust paths / model / GPU as needed.
 ### 1. Prereqs
 
 * `lmsysorg/sglang:dev` (or any sglang container with CUDA 12.x + torch 2.10+).
-* This sglang fork (branch `feat/flexkv-main-connector`) and FlexKV
-  (branch `main`) checked out somewhere reachable from the container
-  — e.g. `/raid/fly/sglang-connector-dir/{sglang,FlexKV}`. Verified
-  against FlexKV main at `aa74e39` (PR #184); older commits down to
-  the layerwise integration also work.
+* This sglang fork (branch `codex/flexkv-decode-mixin-upstream-main`)
+  and FlexKV branch `dpskv4_refactor` checked out somewhere reachable
+  from the container — e.g.
+  `/raid/fly/sglang-connector-dir/{sglang,FlexKV}`. The DSV4 adapter
+  depends on the multi-group registration and SWA APIs from that
+  FlexKV branch; it is not compatible with the old FlexKV `main` API.
 
 ### 2. Start a container with both repos mounted
 
@@ -52,9 +53,9 @@ docker exec flexkv-sglang bash -c '
   cd /raid/fly/sglang-connector-dir/sglang
   pip install --no-deps -e python
 
-  # FlexKV: pin to main, init the xxHash submodule, debug C++ build.
+  # FlexKV: pin to the DSV4 branch, init xxHash, debug C++ build.
   cd /raid/fly/sglang-connector-dir/FlexKV
-  git checkout main && git pull --ff-only
+  git checkout dpskv4_refactor && git pull --ff-only
   git submodule update --init third_party/xxHash
   pip install -q cython ninja pybind11
   FLEXKV_ENABLE_METRICS=0 bash build.sh --debug
@@ -86,6 +87,21 @@ cpu_cache_gb: 16
 That's enough to enable a 16 GiB CPU offload pool. See
 [`example_config_mp.yaml`](example_config_mp.yaml) for SSD / remote /
 distributed knobs.
+
+### DeepSeek V4
+
+`DeepSeekV4TokenToKVPool` is detected automatically. The connector
+registers its c4, c128, c4-indexer, and SWA device buffers through
+FlexKV's heterogeneous multi-group API, requests SWA-aware prefix
+matches, and supplies the translated SWA slot mapping on both loads
+and stores. FlexKV derives the SWA host-pool geometry from the SGLang
+model config; `FLEXKV_ENABLE_SWA_TRANSFER` defaults to `1` for DSV4.
+
+The first DSV4 integration target is the non-unified CUDA pool on one
+node with PP=1 and attention CP=1. TP and DP/DP-attention are supported.
+The adapter fails during startup if it sees the experimental unified
+Triton layout or incompatible pool geometry instead of starting with
+silently incomplete KV transfer.
 
 ### 5. Launch the server (MP / synchronous mode)
 
@@ -290,7 +306,7 @@ fan-out is the "sync follower" — `FlexKVComm` broadcasts the
 leader's lookup / store decisions via gloo CPU groups so non-leader
 ranks know which task ids and slot mappings to use.
 
-Supported:
+For uniform MLA/MHA models, the connector supports:
 
 * **TP** (any size) — typical sglang topology.
 * **DP** (`dp_size > 1`) and multi-instance — FlexKV automatically
@@ -303,6 +319,9 @@ Supported:
 * **DP attention** (`enable_dp_attention=True`) — the inner
   `attn_tp_size` is what FlexKV uses for register-side routing.
 
+For DSV4, the current adapter supports TP and DP/DP-attention on one
+node. PP and attention CP must both remain 1.
+
 ---
 
 ## Environment variables
@@ -310,6 +329,8 @@ Supported:
 * `FLEXKV_CONFIG_PATH` — full FlexKV YAML / JSON config (also set
   automatically by `--flexkv-config-file`).
 * `FLEXKV_ENABLE_LAYERWISE_TRANSFER` — `1` to enable layerwise mode.
+* `FLEXKV_ENABLE_SWA_TRANSFER` — DSV4 SWA data-plane switch; defaults
+  to `1` for DSV4 and must remain enabled for this connector.
 * `FLEXKV_LAYERWISE_EVENTFD_SOCKET` — UDS socket path (default
   `/tmp/flexkv_layerwise_eventfd.sock`); auto-suffixed per
   `(pp_rank, dp_client_id)` when those dims are > 1.
@@ -370,14 +391,16 @@ Supported:
   carried over from the production-validated `BaseKVConnector`
   integration. Not exercised in single-GPU smoke tests; needs a
   multi-node run before shipping.
+* DSV4 multi-group/SWA adapter — Python contract tests cover pool
+  geometry, FlexKV host-block recomputation, registration arguments,
+  and SWA slot translation. A CUDA end-to-end run is still required
+  before treating the path as production-validated.
 
 ### Known limitations
 
-* Hybrid models (Mamba / SWA / DSV4 indexer auxiliary pools) are not
-  supported through this connector — only the primary KV pool is
-  hooked up. HiCache's multi-pool `batch_*_v2` interface would map
-  here but requires `PoolTransfer` + `PoolHitPolicy` plumbing in
-  `FlexKVConnector`.
+* DSV4 requires the non-unified CUDA pool, one node, PP=1, and
+  attention CP=1. Other hybrid layouts such as Mamba are not wired to
+  FlexKV's heterogeneous registration API yet.
 * Write-back acks are per-request (one `dec_lock_ref` per
   `cache_finished_req`), not per-page like HiCache's
   `flush_write_through_acks`.

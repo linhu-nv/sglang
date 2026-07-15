@@ -12,6 +12,7 @@ so the second form is available without further wiring.
 from __future__ import annotations
 
 import logging
+import os
 
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
 
@@ -35,6 +36,7 @@ def _flexkv_factory(ctx):
     from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import (
         FlexKVRadixCache,
     )
+    from sglang.srt.runtime_context import get_parallel
 
     server_args = ctx.server_args
 
@@ -58,6 +60,12 @@ def _flexkv_factory(ctx):
     # fall back to 0 for single-rank dims.
     pp_rank = pp_group.rank_in_group if pp_group is not None else 0
     attn_cp_rank = attn_cp_group.rank_in_group if attn_cp_group is not None else 0
+    if server_args.enable_dp_attention:
+        dp_rank = get_parallel().attn_dp_rank
+    else:
+        # Plain DP workers are separate scheduler processes. The launcher
+        # publishes their route through SGLANG_DP_RANK.
+        dp_rank = int(os.environ.get("SGLANG_DP_RANK", "0"))
 
     return FlexKVRadixCache(
         params=ctx.params,
@@ -65,10 +73,7 @@ def _flexkv_factory(ctx):
         server_args=server_args,
         tp_rank=ctx.tp_rank,
         tp_size=ctx.tp_size,
-        # ``dp_rank`` isn't carried on TreeCacheBuildContext or ServerArgs
-        # at construction time; the connector normalizes ``None`` to 0
-        # for the single-DP-rank case that this factory targets.
-        dp_rank=None,
+        dp_rank=dp_rank,
         pp_rank=pp_rank,
         attn_cp_rank=attn_cp_rank,
         tp_group=ctx.tp_group,
