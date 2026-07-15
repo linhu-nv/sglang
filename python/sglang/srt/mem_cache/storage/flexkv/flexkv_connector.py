@@ -138,7 +138,7 @@ class FlexKVConnector:
                 )
             setattr(self.cache_config, attr, aligned)
 
-        # 4. Extract MLA/MHA KV buffers + optional indexer buffers.
+        # 4. Extract MLA/MHA KV buffers + optional indexer / scale buffers.
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if hasattr(kvcache, "kv_buffer"):
             # MLA: K and V share the same buffer (per-layer tensor).
@@ -152,6 +152,19 @@ class FlexKVConnector:
                 f"expected kv_buffer (MLA/NSA) or k_buffer/v_buffer (MHA)."
             )
         self._kvcache = kvcache
+
+        # FP4 scale buffers (MHATokenToKVPoolFP4 only).
+        scale_buffers: Optional[List[torch.Tensor]] = None
+        if hasattr(kvcache, "k_scale_buffer") and hasattr(kvcache, "v_scale_buffer"):
+            scale_buffers = (
+                list(kvcache.k_scale_buffer) + list(kvcache.v_scale_buffer)
+            )
+            logger.info(
+                "[FlexKV] Detected FP4 scale buffers: %d tensors, "
+                "shape=%s",
+                len(scale_buffers),
+                scale_buffers[0].shape,
+            )
 
         # 5. On multi-node setups, every node beyond node 0 needs a
         # TransferManagerOnRemote process (FlexKV side) before any rank
@@ -191,7 +204,7 @@ class FlexKVConnector:
             pp_rank=self.rank_info.pp_rank,
             device_id=self.rank_info.local_rank,
         )
-        self._register_with_retry(kv_caches, indexer_buffers)
+        self._register_with_retry(kv_caches, indexer_buffers, scale_buffers)
 
         # 8. Layerwise transfer plumbing.
         self.enable_layerwise = bool(
@@ -744,6 +757,7 @@ class FlexKVConnector:
         self,
         kv_caches: List[torch.Tensor],
         indexer_buffers: Optional[List[torch.Tensor]] = None,
+        scale_buffers: Optional[List[torch.Tensor]] = None,
         max_retries: int = 360,
     ) -> None:
         """Retry GPU registration. On node_rank>0, the
@@ -751,7 +765,7 @@ class FlexKVConnector:
         to ~6 minutes."""
         for attempt in range(max_retries):
             try:
-                self._register_to_server(kv_caches, indexer_buffers)
+                self._register_to_server(kv_caches, indexer_buffers, scale_buffers)
                 return
             except Exception as exc:  # noqa: BLE001
                 if attempt == max_retries - 1:
@@ -770,6 +784,7 @@ class FlexKVConnector:
         self,
         kv_caches: List[torch.Tensor],
         indexer_buffers: Optional[List[torch.Tensor]] = None,
+        scale_buffers: Optional[List[torch.Tensor]] = None,
     ) -> None:
         assert len(kv_caches) > 0
         assert (
@@ -806,11 +821,31 @@ class FlexKVConnector:
                 is_mla=True,
             )
 
+        # FP4 scale buffer layout: 2D (num_tokens, num_heads * scale_per_head)
+        scale_layout = None
+        if scale_buffers is not None and len(scale_buffers) > 0:
+            scale_tensor = scale_buffers[0]
+            assert scale_tensor.ndim == 2, (
+                f"Expected 2D scale tensor (num_tokens, total_scale_per_token), "
+                f"got shape={scale_tensor.shape}"
+            )
+            scale_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=self.rank_info.num_layers_per_pp_stage,
+                num_block=scale_tensor.shape[0] // self.page_size,
+                tokens_per_block=self.page_size,
+                num_head=1,
+                head_size=scale_tensor.shape[1],
+                is_mla=False,
+            )
+
         self.tp_client.register_to_server(
             kv_caches=kv_caches,
             kv_layout=gpu_layout,
             indexer_buffers=indexer_buffers,
             indexer_layout=indexer_layout,
+            scale_buffers=scale_buffers,
+            scale_layout=scale_layout,
         )
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
 
