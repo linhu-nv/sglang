@@ -153,17 +153,22 @@ class FlexKVConnector:
             )
         self._kvcache = kvcache
 
-        # FP4 scale buffers (MHATokenToKVPoolFP4 only).
+        # FP4 scale buffers: MHA uses k_scale_buffer + v_scale_buffer (2L),
+        # MLA uses kv_scale_buffer (L).
         scale_buffers: Optional[List[torch.Tensor]] = None
         if hasattr(kvcache, "k_scale_buffer") and hasattr(kvcache, "v_scale_buffer"):
             scale_buffers = (
                 list(kvcache.k_scale_buffer) + list(kvcache.v_scale_buffer)
             )
+        elif hasattr(kvcache, "kv_scale_buffer"):
+            scale_buffers = list(kvcache.kv_scale_buffer)
+        if scale_buffers is not None:
             logger.info(
                 "[FlexKV] Detected FP4 scale buffers: %d tensors, "
-                "shape=%s",
+                "shape=%s, mla=%s",
                 len(scale_buffers),
                 scale_buffers[0].shape,
+                self.model_config.use_mla,
             )
 
         # 5. On multi-node setups, every node beyond node 0 needs a
