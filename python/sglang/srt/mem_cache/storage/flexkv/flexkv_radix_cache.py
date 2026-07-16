@@ -94,6 +94,11 @@ class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
     ) -> None:
         super().__init__(params)
 
+        # PrefillAdder detects hybrid SWA from the device allocator and reads
+        # this metadata even when the selected prefix cache intentionally uses
+        # coupled FULL/SWA eviction (see the size/evict adapters below).
+        self.sliding_window_size = params.sliding_window_size
+
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         # ``tp_group`` and ``attn_tp_group`` are sometimes passed
         # interchangeably by sglang's factory; prefer the explicit
@@ -507,16 +512,45 @@ class FlexKVRadixCache(DecodeFlexKVMixin, RadixCache):
     # evict + completion draining
     # ------------------------------------------------------------------
 
+    def full_evictable_size(self) -> int:
+        """FULL view of the coupled radix-node eviction budget."""
+        return self.evictable_size()
+
+    def swa_evictable_size(self) -> int:
+        """SWA view of the same coupled radix-node eviction budget."""
+        return self.evictable_size()
+
+    def full_protected_size(self) -> int:
+        """FULL view of the coupled radix-node protected budget."""
+        return self.protected_size()
+
+    def swa_protected_size(self) -> int:
+        """SWA view of the same coupled radix-node protected budget."""
+        return self.protected_size()
+
     def evict(self, params: EvictParams) -> EvictResult:  # type: ignore[override]
         """Drain completed stores before letting the base evict touch
-        the source nodes."""
+        the source nodes.
+
+        FlexKV currently stores FULL and SWA device slots on one RadixCache
+        node.  SGLang may request eviction for either side independently, so
+        evict enough coupled nodes to satisfy the larger request.  Freeing the
+        node releases both allocator sides.
+        """
         if self.disable:
             return EvictResult()
         self._drain_completed_stores()
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
         self.store_stream.synchronize()
-        return super().evict(params)
+        num_tokens = max(params.num_tokens, params.swa_num_tokens)
+        result = super().evict(EvictParams(num_tokens=num_tokens))
+        if self.sliding_window_size is None:
+            return result
+        return EvictResult(
+            num_tokens_evicted=result.num_tokens_evicted,
+            swa_num_tokens_evicted=result.num_tokens_evicted,
+        )
 
     def check_hicache_events(self) -> None:  # type: ignore[override]
         """Periodic non-blocking sweep called by the scheduler tick.
