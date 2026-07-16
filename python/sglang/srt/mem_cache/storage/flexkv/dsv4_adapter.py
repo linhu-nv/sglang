@@ -170,14 +170,19 @@ def build_dsv4_registration(
             f"{cache_config.tokens_per_block}"
         )
 
-    ratios = list(getattr(kvcache, "compression_ratios"))
+    all_ratios = list(getattr(kvcache, "compression_ratios"))
     stage_start = int(getattr(kvcache, "_stage_start", 0))
-    stage_end = int(getattr(kvcache, "_stage_end", len(ratios)))
+    stage_end = int(getattr(kvcache, "_stage_end", len(all_ratios)))
     if stage_start != 0 or stage_end != model_config.num_layers:
         raise NotImplementedError("DSV4 heterogeneous registration requires PP=1")
+    # Match DeepSeekV4TokenToKVPool's own allocation contract. Checkpoints may
+    # carry an extra trailing compression ratio for an MTP/placeholder layer,
+    # while the target model and its device pools cover only this stage slice.
+    ratios = all_ratios[stage_start:stage_end]
     if len(ratios) != model_config.num_layers:
         raise ValueError(
-            f"DSV4 has {len(ratios)} compression ratios for "
+            f"DSV4 stage has {len(ratios)} compression ratios from "
+            f"{len(all_ratios)} total entries for "
             f"{model_config.num_layers} model layers"
         )
 

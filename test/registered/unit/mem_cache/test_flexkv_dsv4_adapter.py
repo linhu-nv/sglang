@@ -141,6 +141,18 @@ class TestFlexKVDSV4Adapter(unittest.TestCase):
             },
         )
 
+    def test_ignores_compression_ratios_after_the_model_stage(self) -> None:
+        model, cache = _configs()
+        pool = _FakeDSV4Pool()
+        pool.compression_ratios = [0, 4, 128, 4, 0]
+
+        registration = _ADAPTER.build_dsv4_registration(pool, model, cache)
+
+        self.assertEqual(registration.layer_groups[0].layer_indices, [1, 3])
+        self.assertEqual(registration.layer_groups[1].layer_indices, [2])
+        self.assertEqual(registration.kv_layout.num_layer, 4)
+        self.assertEqual(registration.swa_layout.num_layer, 4)
+
     def test_prepare_attaches_groups_before_host_pool_allocation(self) -> None:
         model, cache = _configs()
         cache._user_cpu_cache_gb = 0.01
