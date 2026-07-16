@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
+    DSATokenToKVPoolFP4,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
@@ -1058,7 +1059,10 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
-            PoolCls = DSATokenToKVPool
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                PoolCls = DSATokenToKVPoolFP4
+            else:
+                PoolCls = DSATokenToKVPool
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
@@ -1724,10 +1728,9 @@ def calculate_mla_kv_cache_dim(
 
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
-    # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
-    # (excluding TRTLLM and HIP raw-layout kernels).
-    # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
-    # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+    if is_float4_e2m1fn_x2(kv_cache_dtype):
+        return kv_cache_dim
+
     if kv_cache_dtype == torch.float8_e4m3fn:
         assert (
             kv_lora_rank % quant_block_size == 0

@@ -4958,6 +4958,7 @@ class ServerArgs:
                             "flashinfer",
                             "trtllm_mla",
                             "flashmla",
+                            "dsa",
                         ]
                         assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                             f"KV4 MLA expects attention_backend to be one of "

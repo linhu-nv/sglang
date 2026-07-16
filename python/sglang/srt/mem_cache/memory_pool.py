@@ -3432,6 +3432,168 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
+class DSATokenToKVPoolFP4(DSATokenToKVPool):
+    """DSA KV pool with FP4 (E2M1) quantization for the latent KV cache.
+
+    Combines DSATokenToKVPool (index_k_with_scale_buffer) with
+    MLATokenToKVPoolFP4 (separate kv_buffer + kv_scale_buffer for FP4 data/scale).
+    """
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = 1
+                k = self.kv_cache_dim
+
+                scale_block_size = 16
+                self.store_dtype = torch.uint8
+
+                self.kv_buffer = [
+                    torch.zeros(
+                        (m, n, k // 2),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                self.kv_scale_buffer = [
+                    torch.zeros(
+                        (m, k // scale_block_size),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+        del self.kv_scale_buffer
+        del self.index_k_with_scale_buffer
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
+                torch.uint8
+            )
+            cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
+
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
+
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
+                cache_k_nope_fp4, cache_k_nope_fp4_sf
+            )
+            return cache_k_nope_fp4_dequant
+
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        loc, _, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(loc, 0, self.size + self.page_size, 'set_kv_buffer (DSA-FP4)')
+        layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
+
+            cache_k_fp4, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(
+                cache_k
+            )
+
+        if self.store_dtype != self.dtype:
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
+                self.store_dtype
+            )
+            self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+                cache_k_fp4_sf.view(self.store_dtype)
+            )
+        else:
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, 'set_mla_kv_buffer (DSA-FP4)'
+        )
+        layer_id = layer.layer_id
+
+        if cache_k_nope.dtype != self.dtype:
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
+
+            cache_k_nope_fp4, cache_k_nope_fp4_sf = (
+                BlockFP4KVQuantizeUtil.batched_quantize(cache_k_nope)
+            )
+            cache_k_rope_fp4, cache_k_rope_fp4_sf = (
+                BlockFP4KVQuantizeUtil.batched_quantize(cache_k_rope)
+            )
+
+        if self.store_dtype != self.dtype:
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope_fp4,
+                cache_k_rope_fp4,
+            )
+            set_mla_kv_scale_buffer_triton(
+                self.kv_scale_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope_fp4_sf,
+                cache_k_rope_fp4_sf,
+            )
+        else:
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for buf in self.kv_buffer:
+            buf[tgt_loc_flat] = buf[src_loc_flat]
+        for buf in self.kv_scale_buffer:
+            buf[tgt_loc_flat] = buf[src_loc_flat]
+        for index_k in self.index_k_with_scale_buffer:
+            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = 0
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        for kv_scale in self.kv_scale_buffer:
+            kv_size_bytes += get_tensor_size_bytes(kv_scale)
+        for index_k_cache in self.index_k_with_scale_buffer:
+            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        return kv_size_bytes
+
+
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],
     v_buffer: List[torch.Tensor],
