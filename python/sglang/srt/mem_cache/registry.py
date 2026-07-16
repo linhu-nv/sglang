@@ -116,6 +116,22 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         )
         return cache
 
+    if server_args.enable_flexkv:
+        # Select FlexKV before the built-in hybrid-model caches. DeepSeek V4 is
+        # detected as hybrid SWA, but --enable-flexkv is an explicit backend
+        # choice and must not silently fall through to SWARadixCache.
+        # Importing the package side-effect also registers the explicit
+        # ``--radix-cache-backend=flexkv`` factory.
+        import os
+
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        # Honor a CLI --flexkv-config-file by forwarding it via the env
+        # var that FlexKV's config loader actually reads.
+        if server_args.flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
+            os.environ["FLEXKV_CONFIG_PATH"] = server_args.flexkv_config_file
+        return _flexkv_factory(ctx)
+
     if ctx.is_hybrid_swa:
         if ctx.full_tokens_per_layer == 0:
             from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
@@ -142,20 +158,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             rank=ctx.tp_rank,
             tp_group=ctx.tp_group,
         )
-
-    if server_args.enable_flexkv:
-        # Importing the package side-effect registers the explicit
-        # ``--radix-cache-backend=flexkv`` factory; we then call the
-        # factory directly so --enable-flexkv stands on its own.
-        import os
-
-        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
-
-        # Honor a CLI --flexkv-config-file by forwarding it via the env
-        # var that FlexKV's config loader actually reads.
-        if server_args.flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
-            os.environ["FLEXKV_CONFIG_PATH"] = server_args.flexkv_config_file
-        return _flexkv_factory(ctx)
 
     from sglang.srt.mem_cache.radix_cache import RadixCache
 

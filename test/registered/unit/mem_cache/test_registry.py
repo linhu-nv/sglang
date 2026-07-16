@@ -24,6 +24,7 @@ def _make_ctx(
     backend=None,
     enable_streaming=False,
     enable_lmcache=False,
+    enable_flexkv=False,
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     enable_hierarchical_cache=False,
@@ -35,7 +36,8 @@ def _make_ctx(
     server_args.radix_cache_backend = backend
     server_args.enable_streaming_session = enable_streaming
     server_args.enable_lmcache = enable_lmcache
-    server_args.enable_flexkv = False
+    server_args.enable_flexkv = enable_flexkv
+    server_args.flexkv_config_file = None
     return TreeCacheBuildContext(
         server_args=server_args,
         params=MagicMock(),
@@ -298,6 +300,23 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             result = default_radix_cache_factory(ctx)
             SWA.assert_called_once_with(params=ctx.params)
             self.assertIs(result, SWA.return_value)
+
+    def test_flexkv_takes_precedence_over_hybrid_swa(self):
+        ctx = _make_ctx(enable_flexkv=True, is_hybrid_swa=True)
+        fake_flexkv_module = MagicMock()
+        fake_swa_module = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.flexkv": fake_flexkv_module,
+                "sglang.srt.mem_cache.swa_radix_cache": fake_swa_module,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_flexkv_module._flexkv_factory.assert_called_once_with(ctx)
+        fake_swa_module.SWARadixCache.assert_not_called()
+        self.assertIs(result, fake_flexkv_module._flexkv_factory.return_value)
 
     def test_pure_swa_radix_cache_when_all_swa(self):
         ctx = _make_ctx(is_hybrid_swa=True, full_tokens_per_layer=0)
