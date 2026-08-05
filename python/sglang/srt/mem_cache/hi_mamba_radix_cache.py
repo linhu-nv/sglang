@@ -1801,6 +1801,7 @@ class HiMambaRadixCache(MambaRadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        router_hint: Optional[dict] = None,
     ):
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
@@ -1832,6 +1833,7 @@ class HiMambaRadixCache(MambaRadixCache):
             last_hash,
             prefix_keys,
             extra_pools=extra_pools,
+            router_hint=router_hint,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
