@@ -16,7 +16,8 @@ This directory plugs it into SGLang as a
 
 - **offload** — SGLang's HiCache host tier writes pages into KVCR's DRAM tier
   (`batch_set_v2` → `deposit()`).
-- **local fetch** — pages come back from that tier (`batch_get_v2` → `get()`).
+- **local fetch** — pages come back from that tier
+  (`batch_get_v2` → `deliver()`).
 - **remote fetch** — when the request carries a dynamo router hint naming
   another instance, KVCR pulls those pages from *that* instance's tier instead
   of recomputing them.
@@ -29,16 +30,35 @@ a peer's residency.
 
 | component | pin |
 |---|---|
-| KVCR | `nvidia-kvcr` 0.1.0, repo commit `873391ce97609c1caf8c785eebb78f7dfa58367d` |
-| NIXL | 1.3.1 (KVCR's own pin) |
-| dynamo | branch `linhu/kvcc-sglang-router-hint`, on top of router-hint PR #11695 |
-| model used in every run below | Qwen3-8B, `--page-size 64` |
+| SGLang adapter | `1c552fdd52cea966979f5ea8ea8f5d802b3ba909`; the DSV4 canary ran its parent `8fb6b9d592f22b2c515584a2fdc8d29304e12196`, before the emitted payload omitted the optional copy-mode field |
+| KVCR public API | main `ea4908931265c5c6b69489e55a2949ae64a0d9fc`, including hint PR #18 and descriptor-list API PR #19 |
+| KVCR multi-pool runtime | `b0c55bb6633ab6df3b5ca6e7e9dba73f37639ec2`, a validation branch containing the PR #20 multipool squash plus the singleton G3 adapter; not merged |
+| NIXL | 1.3.2 (KVCR's current pin) |
+| Dynamo hint schema | main merge `8b030e0ec138724e8427099c8710e90c5b5d3d93` from PR #13134 |
+| current composite canary | DeepSeek-V4-Flash-NVFP4, `--page-size 256`, two B200s |
 
 KVCR's Python API is not stable yet, and its version number does not track it:
-the distribution has sat at `0.1.0` across every breaking change so far,
-including the `kvcc` → `kvcr` package rename itself. Pin the repo commit, not
-the version. A version skew shows up as an `AttributeError` or `TypeError` at
-store construction, not as a silent misbehaviour.
+the distribution has sat at `0.1.0` across breaking changes. Pin the repo
+commit, not the version. Merged PR #19 defines the descriptor-list and named
+pool API, but deliberately retains a singleton runtime. DSV4 needs the
+multi-pool runtime as well. This adapter probes both the composite runtime and
+the merged `kv_hint` contract before allocating the HiCache CPU pools, so an
+API-only or stale KVCR build fails with an actionable error at construction.
+
+### Dynamo-to-SGLang hint boundary
+
+Dynamo PR #13134 emits the canonical versioned `kv.fetch@1.0` envelope in the
+top-level singular request field `kv_hint`. SGLang's request API, following
+RFC #36224, carries that same envelope in the plural field `kv_hints`. The
+Dynamo SGLang adapter therefore must translate `request["kv_hint"]` to the
+SGLang `kv_hints` argument without rebuilding or merging the envelope.
+
+The current head of Dynamo PR #13591 still reads the older nested
+`extra_args.kv_transfer_params.router_hint` field. It must be rebased onto
+#13134 and perform the singular-to-plural handoff for both native and
+non-native SGLang paths. Until that lands, a direct `/generate` request with
+`kv_hints` proves the SGLang → HiCache → KVCR → NIXL path, but it is not proof
+of a Dynamo-router-generated hint reaching SGLang.
 
 ## Running it
 
@@ -227,6 +247,18 @@ superset — no state is lost by waiting, only by not waiting.
 
 **Functional**
 
+- DeepSeek-V4-Flash-NVFP4 composite canary on two B200s: Worker B restored a
+  1,280-token prefix of a 1,536-token prompt from Worker A and computed only
+  the final 256-token page. Six successful `remote_deliver` operations spanned
+  all six DSV4 physical pools. The matching
+  `source_write`/`remote_deliver` operation IDs moved 18/18 blocks and
+  12,720,960/12,720,960 bytes; HiCache reported
+  `completed=1280 matched=0 loaded=1280`, and all five control/reuse outputs
+  were token-identical. This request carried the exact canonical hint directly
+  in SGLang's `kv_hints` field, so it proves the SGLang/HiCache/KVCR/NIXL path,
+  not the still-pending Dynamo adapter handoff described above. Both workers
+  were on one node with a localhost control endpoint, so this is not a
+  cross-node/RDMA result or a performance benchmark.
 - Two instances, dynamo-routed, hint-driven remote fetch: 4/4 runs, with the
   full causal chain in the logs (31 blocks × 64 = 1984 `cached_tokens`).
   Re-verified against `nvidia-kvcr` `873391c` after the rename, 2/2, counters
@@ -257,8 +289,24 @@ recompute, never admit wrong KV:
 distinct prefixes each. Established that the collapse we saw is the HiCache
 sizing issue below, and *not* `local_dram_bytes`.
 
-**Unit** — `test/registered/mem_cache/test_kvcr_*.py`, passing in-container
-against `873391c`.
+**Current unit** — against SGLang `8fb6b9d5` and the validation runtime
+`b0c55bb6`:
+
+- 77 focused KVCR composite/G3/hint tests passed.
+- 108 focused SGLang tests and 39 subtests passed, including hint schema,
+  capability gates, composite descriptors, TP/concurrency, HiCache sidecar,
+  and hybrid-storage lifecycle coverage.
+- After removing KVCR's optional `mode` field to emit Dynamo's exact two-field
+  payload, the final schema regression passed 16 tests and 13 subtests at
+  SGLang `1c552fdd`.
+- The full KVCR sweep reached 309 passes, then reported three failures and two
+  teardown errors confined to `test_guard_integration.py`. One real-UCX Guard
+  failure reproduces on KVCR main. The other two come from unrelated
+  terminal-resource-retention work bundled in the validation squash: a source
+  is killed mid-write and never sends the terminal notification now required
+  by `close()`. Multi-pool DSV4 rejects Guard recovery and does not execute
+  this path; it still needs separate repair before treating that validation
+  runtime as release-ready.
 
 ## Known issues
 
@@ -309,22 +357,24 @@ against `873391c`.
    KVCR's own tier, where its refcount holds the slot for the duration of the
    write. Cost is a miss, never a wrong result.
 
-6. **Benchmarked only on two models.** Dense Qwen3-8B showed +53–59% qps and
-   −50% TTFT, but only once the distinct working set exceeded the device pool;
-   an FP8 MoE model showed +20% on the same harness. Do not extrapolate the
-   dense number — and note both were taken before the KVCR rename.
+6. **Performance-benchmarked only on two older models.** Dense Qwen3-8B showed
+   +53–59% qps and -50% TTFT, but only once the distinct working set exceeded
+   the device pool; an FP8 MoE model showed +20% on the same harness. The DSV4
+   run described above is a correctness canary, not a performance benchmark.
+   Do not extrapolate the dense number; both performance results predate the
+   KVCR rename.
 
 ## Where to look in the code
 
 | file | what it holds |
 |---|---|
-| `kvcr_store.py` | the whole backend: the `HiCacheStorage` surface, deposit/get, the remote-hint path, counters |
+| `kvcr_store.py` | the whole backend: the `HiCacheStorage` surface, deposit/deliver, the remote-hint path, counters |
 | `router_hint.py` | parsing the dynamo hint and normalizing block hashes (the wire seam — a mismatch here silently makes every hint cover zero pages) |
 | `pin_adapter.py` | the KVCR→framework pin callbacks, deliberately declining (see issue 5) |
 | `kvcr_config.py` | `--hicache-storage-backend-extra-config` schema and timeouts |
 
-Outside this directory the change is small — 13 files, ~190 lines, mostly
-threading `kv_hints` from the request through the scheduler down to
-`batch_exists`/`batch_get`. Note SGLang has **two** prefetch controller stacks
-(`HiCacheController` and `HybridCacheController`); both had to be threaded or
-the untouched one raises `TypeError`.
+Outside this directory the request-plumbing changes thread `kv_hints` from the
+request through the scheduler down to `batch_exists`/`batch_get`. Note SGLang
+has **two** prefetch controller stacks (`HiCacheController` and
+`HybridCacheController`); both must carry the hint or the untouched path either
+drops it or raises `TypeError`.
