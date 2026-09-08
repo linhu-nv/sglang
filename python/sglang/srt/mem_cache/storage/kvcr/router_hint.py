@@ -156,6 +156,10 @@ class RouterHint(msgspec.Struct, kw_only=True):
 
     source_control_endpoint: str
     block_hashes: Tuple[str, ...] = ()
+    # Correlation identities from the typed Dynamo envelope. Bare legacy
+    # payloads have neither, so submission supplies request-scoped fallbacks.
+    message_id: Optional[str] = None
+    action_id: Optional[str] = None
     # Derived from block_hashes in __post_init__; never passed in. The core runs
     # covers() once per block key, so the set is built once here rather than per
     # call. Keeping it on the struct (rather than in a keyed cache) makes the
@@ -166,7 +170,13 @@ class RouterHint(msgspec.Struct, kw_only=True):
         self.covered_pages = frozenset(self.block_hashes)
 
     @classmethod
-    def maybe_from_payload(cls, payload) -> Optional[RouterHint]:
+    def maybe_from_payload(
+        cls,
+        payload,
+        *,
+        message_id: object = None,
+        action_id: object = None,
+    ) -> Optional[RouterHint]:
         """Build a hint from a raw wire dict, or None if it is not well-formed."""
         if not isinstance(payload, dict):
             return None
@@ -185,7 +195,14 @@ class RouterHint(msgspec.Struct, kw_only=True):
                 # drop the entry and silently shift the remaining hashes.
                 break
             normalized.append(canonical)
-        return cls(source_control_endpoint=endpoint, block_hashes=tuple(normalized))
+        return cls(
+            source_control_endpoint=endpoint,
+            block_hashes=tuple(normalized),
+            message_id=(
+                message_id if isinstance(message_id, str) and message_id else None
+            ),
+            action_id=(action_id if isinstance(action_id, str) and action_id else None),
+        )
 
     @classmethod
     def maybe_from_envelope(cls, envelope) -> Optional[RouterHint]:
@@ -217,7 +234,11 @@ class RouterHint(msgspec.Struct, kw_only=True):
             # against this schema would silently misread it. Skip instead.
             if action_contract not in _SUPPORTED_FETCH_ACTIONS:
                 continue
-            hint = cls.maybe_from_payload(action.get("payload"))
+            hint = cls.maybe_from_payload(
+                action.get("payload"),
+                message_id=envelope.get("message_id"),
+                action_id=action.get("action_id"),
+            )
             if hint is not None:
                 return hint
         return None
@@ -256,15 +277,18 @@ class RouterHint(msgspec.Struct, kw_only=True):
         hashes go over as **unsigned** ints: the core validates them into
         ``0 <= h < 1<<64`` and compares them against ``KeyAdapter.decode``, so
         a signed value here would be rejected outright, and a signed decode on
-        the other side would miss every block without erroring. ``message_id``
-        is the same request-scoped identifier used for KVCR hint lifetime.
+        the other side would miss every block without erroring. The original
+        Dynamo message/action identities are preserved for correlation; the
+        supplied ``message_id`` is only a fallback for a legacy bare payload.
         """
+        envelope_message_id = self.message_id or message_id
+        envelope_action_id = self.action_id or f"{envelope_message_id}:fetch"
         return {
             "protocol_version": KVCR_HINT_PROTOCOL_VERSION,
-            "message_id": message_id,
+            "message_id": envelope_message_id,
             "actions": [
                 {
-                    "action_id": f"{message_id}:fetch",
+                    "action_id": envelope_action_id,
                     "action_type": KVCR_FETCH_ACTION_TYPE,
                     "action_version": KVCR_FETCH_ACTION_VERSION,
                     "payload": {

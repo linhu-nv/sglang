@@ -125,11 +125,24 @@ class CoreHandoffTest(unittest.TestCase):
         )
         envelope = hint.to_kvcr_hint(message_id="test-request")
         self.assertEqual(envelope["protocol_version"], KVCR_HINT_PROTOCOL_VERSION)
-        self.assertEqual(envelope["message_id"], "test-request")
+        self.assertEqual(envelope["message_id"], "2f82414c-0ab8-4b9e-a806-168d3ad8a1fd")
         action = envelope["actions"][0]
         self.assertEqual(action["action_type"], KVCR_FETCH_ACTION_TYPE)
         self.assertEqual(action["action_version"], KVCR_FETCH_ACTION_VERSION)
-        self.assertEqual(action["action_id"], "test-request:fetch")
+        self.assertEqual(action["action_id"], "src-0")
+
+    def test_bare_payload_uses_request_scoped_identity_fallbacks(self):
+        hint = RouterHint.maybe_from_extra_info(
+            _extra_info_raw(
+                {
+                    "source_control_endpoint": "tcp://peer:25000",
+                    "block_hashes": [_PAGE_HASH],
+                }
+            )
+        )
+        envelope = hint.to_kvcr_hint(message_id="test-request")
+        self.assertEqual(envelope["message_id"], "test-request")
+        self.assertEqual(envelope["actions"][0]["action_id"], "test-request:fetch")
 
     def test_installed_kvcr_parser_accepts_the_submitted_envelope(self):
         try:
@@ -273,6 +286,8 @@ class EnvelopeTest(unittest.TestCase):
         self.assertIsNotNone(hint)
         self.assertTrue(hint.covers(_PAGE_HASH))
         submitted = hint.to_kvcr_hint(message_id="request-7")
+        self.assertEqual(submitted["message_id"], "msg-123")
+        self.assertEqual(submitted["actions"][0]["action_id"], "a1")
         try:
             from kvcr.hint_parser import _parse_kv_hint
         except ImportError:
