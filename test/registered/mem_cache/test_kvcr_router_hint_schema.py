@@ -10,9 +10,11 @@ it as ``ExternalSequenceBlockHash(u64)`` and echoes it back as a bare JSON
 number, so ``page hash -> event int64 -> u64 -> hint -> page key`` must land
 back on the same 16 hex chars the store compares against.
 
-The hint travels inside the v0.1 KV-hint envelope (dynamo #13134, SGLang RFC
-#36224) as a ``kv.source_locations@1.0`` action; ``EnvelopeTest`` covers that
-outer layer. Needs no ``kvcr`` wheel.
+The router-facing hint travels inside the v0.1 KV-hint envelope (dynamo #13134,
+SGLang RFC #36224) as a ``kv.fetch@1.0`` action. SGLang parses, rank-realigns,
+and rebuilds that action before submitting it to KVCR. The structural tests
+need no ``kvcr`` wheel; when one is installed, the contract test also invokes
+its real parser.
 
     python -m pytest test/registered/mem_cache/test_kvcr_router_hint_schema.py -v
 """
@@ -23,6 +25,9 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
+    KVCR_FETCH_ACTION_TYPE,
+    KVCR_FETCH_ACTION_VERSION,
+    KVCR_HINT_PROTOCOL_VERSION,
     ROUTER_HINT_KEY,
     SOURCE_LOCATIONS_ACTION_TYPE,
     SOURCE_LOCATIONS_ACTION_VERSION,
@@ -45,15 +50,15 @@ _U64_MASK = (1 << 64) - 1
 
 
 def _envelope(payload, *, action_type=None, action_version=None):
-    """Wrap a kv.source_locations payload in the v0.1 KV-hint envelope."""
+    """Wrap a payload in the canonical v0.1 Dynamo KV-hint envelope."""
     return {
         "protocol_version": "0.1",
         "message_id": "2f82414c-0ab8-4b9e-a806-168d3ad8a1fd",
         "actions": [
             {
                 "action_id": "src-0",
-                "action_type": action_type or SOURCE_LOCATIONS_ACTION_TYPE,
-                "action_version": action_version or SOURCE_LOCATIONS_ACTION_VERSION,
+                "action_type": action_type or KVCR_FETCH_ACTION_TYPE,
+                "action_version": action_version or KVCR_FETCH_ACTION_VERSION,
                 "payload": payload,
             }
         ],
@@ -61,7 +66,7 @@ def _envelope(payload, *, action_type=None, action_version=None):
 
 
 def _extra_info(payload):
-    """extra_info carrying `payload` as the envelope's one source-locations action."""
+    """extra_info carrying `payload` as the envelope's one fetch action."""
     return SimpleNamespace(extra_info={ROUTER_HINT_KEY: _envelope(payload)})
 
 
@@ -104,12 +109,67 @@ class CoreHandoffTest(unittest.TestCase):
                 }
             )
         )
-        submitted = hint.to_kvcr_hint()["block_hashes"]
+        envelope = hint.to_kvcr_hint(message_id="test-request")
+        submitted = envelope["actions"][0]["payload"]["block_hashes"]
         self.assertTrue(all(0 <= h < 1 << 64 for h in submitted))
         self.assertEqual(submitted, [int(page_hash_key(_PAGE_HASH), 16)])
 
+    def test_submitted_hint_is_a_versioned_kvcr_fetch_action(self):
+        hint = RouterHint.maybe_from_extra_info(
+            _extra_info(
+                {
+                    "source_control_endpoint": "tcp://peer:25000",
+                    "block_hashes": [_PAGE_HASH],
+                }
+            )
+        )
+        envelope = hint.to_kvcr_hint(message_id="test-request")
+        self.assertEqual(envelope["protocol_version"], KVCR_HINT_PROTOCOL_VERSION)
+        self.assertEqual(envelope["message_id"], "2f82414c-0ab8-4b9e-a806-168d3ad8a1fd")
+        action = envelope["actions"][0]
+        self.assertEqual(action["action_type"], KVCR_FETCH_ACTION_TYPE)
+        self.assertEqual(action["action_version"], KVCR_FETCH_ACTION_VERSION)
+        self.assertEqual(action["action_id"], "src-0")
+        self.assertNotIn("mode", action["payload"])
+
+    def test_bare_payload_uses_request_scoped_identity_fallbacks(self):
+        hint = RouterHint.maybe_from_extra_info(
+            _extra_info_raw(
+                {
+                    "source_control_endpoint": "tcp://peer:25000",
+                    "block_hashes": [_PAGE_HASH],
+                }
+            )
+        )
+        envelope = hint.to_kvcr_hint(message_id="test-request")
+        self.assertEqual(envelope["message_id"], "test-request")
+        self.assertEqual(envelope["actions"][0]["action_id"], "test-request:fetch")
+
+    def test_installed_kvcr_parser_accepts_the_submitted_envelope(self):
+        try:
+            from kvcr.hint_parser import _parse_kv_hint
+        except ImportError:
+            self.skipTest("nvidia-kvcr wheel not installed")
+
+        hint = RouterHint.maybe_from_extra_info(
+            _extra_info(
+                {
+                    "source_control_endpoint": "tcp://peer:25000",
+                    "block_hashes": [_PAGE_HASH],
+                }
+            )
+        )
+        self.assertEqual(
+            _parse_kv_hint(hint.to_kvcr_hint(message_id="test-request")),
+            (
+                "tcp://peer:25000",
+                frozenset({int(page_hash_key(_PAGE_HASH), 16)}),
+                "copy",
+            ),
+        )
+
     def test_decode_matches_a_submitted_hash(self):
-        """A segment key must decode onto the hash its own page was hinted with."""
+        """A composite key must decode onto its hinted logical-page hash."""
         adapter = StrKeyAdapter()
         hint = RouterHint.maybe_from_extra_info(
             _extra_info(
@@ -119,9 +179,10 @@ class CoreHandoffTest(unittest.TestCase):
                 }
             )
         )
-        hashes = frozenset(hint.to_kvcr_hint()["block_hashes"])
-        segment_key = adapter.encode(f"{_PAGE_HASH}#3")
-        self.assertIn(adapter.decode(segment_key), hashes)
+        payload = hint.to_kvcr_hint(message_id="test-request")["actions"][0]["payload"]
+        hashes = frozenset(payload["block_hashes"])
+        composite_key = adapter.encode(f"{_PAGE_HASH}#v5/layout/deepseek_v4_c4")
+        self.assertIn(adapter.decode(composite_key), hashes)
 
     def test_decode_rejects_an_unhinted_page(self):
         adapter = StrKeyAdapter()
@@ -133,7 +194,8 @@ class CoreHandoffTest(unittest.TestCase):
                 }
             )
         )
-        hashes = frozenset(hint.to_kvcr_hint()["block_hashes"])
+        payload = hint.to_kvcr_hint(message_id="test-request")["actions"][0]["payload"]
+        hashes = frozenset(payload["block_hashes"])
         other = adapter.encode(f"{_SMALL_PAGE_HASH}#0")
         self.assertNotIn(adapter.decode(other), hashes)
 
@@ -198,6 +260,56 @@ class EnvelopeTest(unittest.TestCase):
     def test_a_bare_payload_is_still_accepted(self):
         """Pre-envelope shape (dynamo #11695) must keep working until it retires."""
         hint = RouterHint.maybe_from_extra_info(_extra_info_raw(self._PAYLOAD))
+        self.assertIsNotNone(hint)
+        self.assertTrue(hint.covers(_PAGE_HASH))
+
+    def test_merged_dynamo_fetch_envelope_reaches_the_kvcr_parser(self):
+        """Pin the exact action shape serialized by merged Dynamo PR #13134."""
+        wire_value = hash_str_to_int64(_PAGE_HASH) & _U64_MASK
+        dynamo_envelope = {
+            "protocol_version": "0.1",
+            "message_id": "msg-123",
+            "actions": [
+                {
+                    "action_id": "a1",
+                    "action_type": "kv.fetch",
+                    "action_version": "1.0",
+                    "payload": {
+                        "source_control_endpoint": "tcp://peer:25000",
+                        "block_hashes": [wire_value],
+                    },
+                }
+            ],
+        }
+
+        hint = RouterHint.maybe_from_extra_info(_extra_info_raw(dynamo_envelope))
+
+        self.assertIsNotNone(hint)
+        self.assertTrue(hint.covers(_PAGE_HASH))
+        submitted = hint.to_kvcr_hint(message_id="request-7")
+        self.assertEqual(submitted["message_id"], "msg-123")
+        self.assertEqual(submitted["actions"][0]["action_id"], "a1")
+        try:
+            from kvcr.hint_parser import _parse_kv_hint
+        except ImportError:
+            self.assertEqual(submitted["actions"][0]["action_type"], "kv.fetch")
+        else:
+            self.assertEqual(
+                _parse_kv_hint(submitted),
+                (
+                    "tcp://peer:25000",
+                    frozenset({wire_value}),
+                    "copy",
+                ),
+            )
+
+    def test_legacy_source_locations_action_is_still_accepted(self):
+        envelope = _envelope(
+            self._PAYLOAD,
+            action_type=SOURCE_LOCATIONS_ACTION_TYPE,
+            action_version=SOURCE_LOCATIONS_ACTION_VERSION,
+        )
+        hint = RouterHint.maybe_from_extra_info(_extra_info_raw(envelope))
         self.assertIsNotNone(hint)
         self.assertTrue(hint.covers(_PAGE_HASH))
 

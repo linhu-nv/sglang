@@ -45,6 +45,9 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # True when tp_rank/tp_size are the attention-TP coordinates and DP/CP
+    # must be added to recover the scheduler's engine-global coordinate.
+    tp_rank_is_attention_scoped: bool = False
 
 
 @dataclass
@@ -166,6 +169,28 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
     }
 
 
+def count_expected_pool_hits(
+    results: dict[str, List[bool]], transfers: List[PoolTransfer]
+) -> dict[str, int]:
+    """Count leading hits, failing closed for missing or malformed pool results."""
+    hits: dict[str, int] = {}
+    for transfer in transfers:
+        name = str(transfer.name)
+        result = results.get(transfer.name)
+        if result is None:
+            result = results.get(name)
+        expected = len(transfer.keys or [])
+        if (
+            not isinstance(result, (list, tuple))
+            or len(result) != expected
+            or any(type(value) is not bool for value in result)
+        ):
+            hits[name] = 0
+            continue
+        hits[name] = result.index(False) if False in result else len(result)
+    return hits
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
@@ -180,6 +205,15 @@ class HiCacheStorage(ABC):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
+
+    def finalize_mem_pool_registration(self) -> None:
+        """Finish backend setup after every initial host pool is registered.
+
+        Backends that construct resources from the complete pool topology can
+        override this hook. It is intentionally optional so existing built-in
+        and dynamically loaded backends keep their current lifecycle.
+        """
+        pass
 
     def batch_exists_v2(
         self,

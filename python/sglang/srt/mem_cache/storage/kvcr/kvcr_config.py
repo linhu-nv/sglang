@@ -29,10 +29,11 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     # deposit() copies engine host KV into slots carved from this region.
     local_dram_bytes: int = 1 << 30  # 1 GiB placeholder
 
-    # Number of slots the local DRAM region is divided into. slot_size =
-    # local_dram_bytes // local_dram_slots and MUST equal the host KV page byte
-    # size, so this is validated against the real page size at registration.
-    local_dram_slots: int = 0  # 0 => derive from page size at registration
+    # Number of slots the local DRAM region is divided into. For a hybrid pool,
+    # this is the total component-slot budget; only complete logical-page sets
+    # are allocated across the size-classed arenas. Zero derives capacity from
+    # local_dram_bytes and the probed page geometry.
+    local_dram_slots: int = 0
 
     # Control-plane (ZMQ peer channel) bind host/port for cross-worker P2P.
     # control_port 0 means "ask the OS", which is fine local-only and refused
@@ -47,10 +48,10 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     enable_telemetry: bool = False
     # Budget for one KVCR operation end to end. The core's own default is 1000ms,
     # which is too tight here: the *source* clamps its pin deadline to this
-    # value, and a single prefetch fans a 64-token page out into many block keys
-    # (192 for a 96-page request), all of which must be pinned and written
-    # before it expires. At 1000ms that reliably force-failed a fetch that had
-    # every key resident on the source.
+    # value, and a single prefetch can carry many composite page records whose
+    # physical components must all be pinned and written before it expires. At
+    # 1000ms that reliably force-failed a fetch that had every key resident on
+    # the source.
     operation_timeout_ms: int = 20000
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False
@@ -74,10 +75,17 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     # commit can serve today.
     enable_remote_hint: bool = False
 
-    # Wall-clock budget for one deposit/deliver to report completion on the
-    # HiCache prefetch daemon thread. A remote fetch crosses the control plane
-    # plus a NIXL transfer, so this is generously above operation_timeout_ms;
-    # exceeding it is reported as a miss and HiCache recomputes.
+    # Immutable identity of the bytes stored behind a hybrid cache key. It must
+    # cover the model checkpoint/revision, cache dtype and quantization, and
+    # layer/component mapping. The adapter combines it with the runtime pool
+    # manifest and rank topology before allowing hybrid peer reuse.
+    cache_abi: Optional[str] = None
+
+    # Legacy-named soft overdue threshold for one deposit/deliver on the HiCache
+    # prefetch daemon. A remote fetch crosses the control plane plus a NIXL
+    # transfer, so this is generously above operation_timeout_ms. The adapter
+    # logs after this threshold but retains the destination until KVCR reports
+    # terminal.
     get_timeout_s: float = 30.0
 
     def __post_init__(self) -> None:
@@ -93,39 +101,17 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     def _validate_timeout_ordering(self) -> None:
         """``get_timeout_s`` must outlast the core's own operation deadline.
 
-        ``_drain_until`` stops waiting at ``get_timeout_s`` and returns a miss.
-        It cannot cancel: ``kvcr.abort()`` is a no-op stub, and NIXL's
-        cancellation path releases the transfer handle without fencing an
-        in-flight DMA. HiCache then frees the operation's host pages -- via
-        ``append_host_mem_release`` in ``prefetch_io_aux_func``, or via
-        ``check_prefetch_progress`` on the scheduler thread -- and hands them to
-        the next prefetch.
-
-        Ordering the two this way is necessary, not sufficient. Both ends anchor
-        their deadline to ``operation_timeout_ms``, so waiting past it means no
-        peer *starts* a new write into those pages -- but the deadline is a
-        timer, not a DMA fence. The source's expiry drives ``poll_transfer
-        (cancellation_requested=True)`` into NIXL, whose contract is that the
-        transfer is cancelled *or errors*; a descriptor the NIC has already
-        begun can still land after the handle is released. Closing that hole
-        needs a per-op quiescence signal from KVCR (``abort()`` is a no-op stub
-        today, ``core.py``), which is filed upstream; this check only removes the
-        configuration that makes the race certain rather than unlikely.
-
-        Order the two the other way and an abandoned fetch is still being
-        actively driven while HiCache hands its pages to the next request, which
-        surfaces as wrong KV rather than as an error -- block keys are token
-        hashes with no content check, so nothing downstream can notice. Both
-        knobs are operator-settable, so the ordering is enforced here rather than
-        left as a comment on the defaults.
+        KVCR's operation deadline should fire before this adapter calls the wait
+        overdue. The adapter still waits for a KVCR terminal/quiescence result;
+        this ordering keeps the normal core timeout path ahead of the
+        operator-facing warning.
         """
         if self.get_timeout_s * 1000.0 <= self.operation_timeout_ms:
             raise ValueError(
                 f"KVCR get_timeout_s ({self.get_timeout_s}s) must exceed "
                 f"operation_timeout_ms ({self.operation_timeout_ms}ms): giving "
-                "up before the core does leaves an uncancellable transfer "
-                "writing into host pages HiCache has already reused, which "
-                "corrupts KV silently. Raise get_timeout_s or lower "
+                "the adapter's overdue threshold should outlast the core's "
+                "operation deadline. Raise get_timeout_s or lower "
                 "operation_timeout_ms in --hicache-storage-backend-extra-config."
             )
 

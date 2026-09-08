@@ -33,13 +33,18 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
+    KVCR_FETCH_ACTION_TYPE,
+    KVCR_FETCH_ACTION_VERSION,
     ROUTER_HINT_KEY,
-    SOURCE_LOCATIONS_ACTION_TYPE,
-    SOURCE_LOCATIONS_ACTION_VERSION,
+    RouterHint,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -73,6 +78,15 @@ else:  # pragma: no cover - wheel not installed on this tier
 _needs_kvcr = unittest.skipUnless(_HAS_KVCR, "nvidia-kvcr wheel not installed")
 
 
+def _wait_until(predicate, timeout_s: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
 class TestKVCRImports(unittest.TestCase):
     """Fail loudly when an installed kvcr no longer satisfies this adapter."""
 
@@ -85,6 +99,32 @@ class TestKVCRImports(unittest.TestCase):
             f"{_KVCR_IMPORT_ERROR}",
         )
 
+    @unittest.skipUnless(_HAS_KVCR, "KVCRStore did not import")
+    def test_composite_runtime_probe_distinguishes_api_only_kvcr(self):
+        with mock.patch.object(
+            kvcr_store,
+            "KVCRBackendConfigs",
+            SimpleNamespace(__dataclass_fields__={}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "#19 provides.*foundation"):
+                kvcr_store._require_kvcr_composite_runtime()
+
+        with mock.patch.object(
+            kvcr_store,
+            "KVCRBackendConfigs",
+            SimpleNamespace(__dataclass_fields__={"framework_dram_regions": object()}),
+        ):
+            kvcr_store._require_kvcr_composite_runtime()
+
+    @unittest.skipUnless(_HAS_KVCR, "KVCRStore did not import")
+    def test_hint_contract_probe_rejects_the_pre_envelope_runtime(self):
+        with mock.patch.object(kvcr_store, "KVCR_ROUTER_HINT_KEY", "router_hint"):
+            with self.assertRaisesRegex(RuntimeError, "versioned kv_hint/kv.fetch"):
+                kvcr_store._require_kvcr_hint_contract()
+
+        with mock.patch.object(kvcr_store, "KVCR_ROUTER_HINT_KEY", "kv_hint"):
+            kvcr_store._require_kvcr_hint_contract()
+
 
 _BASE_CONTROL_PORT = 25000
 
@@ -96,6 +136,8 @@ def _storage_config(
     dp_size: int = 1,
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
+    is_mla_model: bool = False,
+    tp_rank_is_attention_scoped: bool | None = None,
     **extra,
 ) -> HiCacheStorageConfig:
     """One scheduler's config.
@@ -109,8 +151,11 @@ def _storage_config(
         "control_port": _BASE_CONTROL_PORT,
         "control_advertise_host": "127.0.0.1",
         "enable_remote_hint": True,
+        "cache_abi": "test-cache-abi",
     }
     extra_config.update(extra)
+    if tp_rank_is_attention_scoped is None:
+        tp_rank_is_attention_scoped = dp_size > 1
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=tp_size,
@@ -118,13 +163,14 @@ def _storage_config(
         pp_size=1,
         attn_cp_rank=attn_cp_rank,
         attn_cp_size=attn_cp_size,
-        is_mla_model=False,
+        is_mla_model=is_mla_model,
         enable_storage_metrics=False,
         is_page_first_layout=True,
         model_name="test-model",
         dp_rank=dp_rank,
         dp_size=dp_size,
         extra_config=extra_config,
+        tp_rank_is_attention_scoped=tp_rank_is_attention_scoped,
     )
 
 
@@ -135,6 +181,8 @@ def _store(
     dp_size: int = 1,
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
+    is_mla_model: bool = False,
+    tp_rank_is_attention_scoped: bool | None = None,
     **extra,
 ) -> KVCRStore:
     """A KVCRStore with no mem_pool, so the core is never constructed."""
@@ -146,6 +194,8 @@ def _store(
             dp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
+            is_mla_model=is_mla_model,
+            tp_rank_is_attention_scoped=tp_rank_is_attention_scoped,
             **extra,
         ),
         mem_pool=None,
@@ -162,8 +212,8 @@ def _hint_extra_info(endpoint: str) -> HiCacheStorageExtraInfo:
                 "actions": [
                     {
                         "action_id": "src-0",
-                        "action_type": SOURCE_LOCATIONS_ACTION_TYPE,
-                        "action_version": SOURCE_LOCATIONS_ACTION_VERSION,
+                        "action_type": KVCR_FETCH_ACTION_TYPE,
+                        "action_version": KVCR_FETCH_ACTION_VERSION,
                         "payload": {
                             "source_control_endpoint": endpoint,
                             "block_hashes": ["0123456789abcdef"],
@@ -221,13 +271,19 @@ class FakeKVCR:
     def __init__(self) -> None:
         self._pending: List[Tuple[int, Dict]] = []
         self._lock = threading.Lock()
+        self.submitted = threading.Event()
         self.poll_calls = 0
         self.next_handle = 100
+        self.last_handle = None
+        self.last_destinations = None
 
     def deliver(self, destinations, request_id=None) -> int:
         with self._lock:
             self.next_handle += 1
-            return self.next_handle
+            self.last_handle = self.next_handle
+            self.last_destinations = destinations
+            self.submitted.set()
+            return self.last_handle
 
     def finish(self, op_handle: int, keys: List[str]) -> None:
         with self._lock:
@@ -239,6 +295,21 @@ class FakeKVCR:
             drained = self._pending
             self._pending = []
             return drained
+
+
+class RecoverablePollFaultKVCR(FakeKVCR):
+    """Accept an op, then fail polling until the test explicitly recovers it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.poll_faulted = threading.Event()
+        self.poll_recovered = threading.Event()
+
+    def poll_completed(self):
+        if not self.poll_recovered.is_set():
+            self.poll_faulted.set()
+            raise RuntimeError("injected post-submit poll fault")
+        return super().poll_completed()
 
 
 @_needs_kvcr
@@ -283,6 +354,64 @@ class TPColocationTest(unittest.TestCase):
                 3: _BASE_CONTROL_PORT + 3,
             },
         )
+
+    def test_cp_ranks_get_distinct_ports_when_dp_size_is_one(self):
+        """DSV4 round-robin CP has DP=1 and attention-TP=1.
+
+        In that topology every scheduler reports tp_rank=0, so CP must still be
+        part of the bind offset or all ranks silently contend for the base port.
+        """
+        ports = {
+            cp_rank: _store(
+                0,
+                1,
+                attn_cp_rank=cp_rank,
+                attn_cp_size=4,
+                is_mla_model=True,
+                tp_rank_is_attention_scoped=True,
+            )._control_port()
+            for cp_rank in range(4)
+        }
+
+        self.assertEqual(
+            ports,
+            {
+                0: _BASE_CONTROL_PORT,
+                1: _BASE_CONTROL_PORT + 1,
+                2: _BASE_CONTROL_PORT + 2,
+                3: _BASE_CONTROL_PORT + 3,
+            },
+        )
+
+    def test_every_cp_rank_rejects_a_base_port_that_cannot_fit_the_group(self):
+        for cp_rank in range(4):
+            with (
+                self.subTest(cp_rank=cp_rank),
+                self.assertRaisesRegex(ValueError, "highest rank"),
+            ):
+                _store(
+                    0,
+                    1,
+                    attn_cp_rank=cp_rank,
+                    attn_cp_size=4,
+                    is_mla_model=True,
+                    tp_rank_is_attention_scoped=True,
+                    control_port=65533,
+                )._control_port()
+
+    def test_global_tp_rank_is_not_double_counted_by_cp_metadata(self):
+        """Without DP attention, tp_rank already identifies the scheduler."""
+        store = _store(
+            3,
+            4,
+            attn_cp_rank=3,
+            attn_cp_size=4,
+            is_mla_model=True,
+        )
+
+        self.assertEqual(store._control_port(), _BASE_CONTROL_PORT + 3)
+        hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+        self.assertEqual(hint.source_control_endpoint, "tcp://10.0.0.7:25003")
 
 
 @_needs_kvcr
@@ -356,6 +485,23 @@ class DPColocationTest(unittest.TestCase):
             },
         )
 
+    def test_scoped_dp_cp_tp_coordinates_cover_one_unique_port_block(self):
+        ports = {
+            _store(
+                tp_rank,
+                2,
+                dp_rank,
+                2,
+                attn_cp_rank=cp_rank,
+                attn_cp_size=2,
+            )._control_port()
+            for dp_rank in range(2)
+            for cp_rank in range(2)
+            for tp_rank in range(2)
+        }
+
+        self.assertEqual(ports, set(range(_BASE_CONTROL_PORT, _BASE_CONTROL_PORT + 8)))
+
     def test_the_dialed_source_port_ignores_our_dp_rank(self):
         """The router already picked the source DP rank; we add only our own
         within-DP offset.
@@ -385,6 +531,96 @@ class DPColocationTest(unittest.TestCase):
 @_needs_kvcr
 class UnusableHostPoolTest(unittest.TestCase):
     """Host pool layouts the backend cannot run against must fail at startup."""
+
+    @staticmethod
+    def _two_component_pool():
+        buffer = torch.empty(32, dtype=torch.uint8)
+        return SimpleNamespace(
+            page_size=2,
+            kv_buffer=buffer,
+            get_page_buffer_meta=lambda _indices: (
+                [buffer.data_ptr(), buffer.data_ptr() + 8],
+                [8, 8],
+            ),
+        )
+
+    def test_logical_anchor_defers_core_construction(self):
+        store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None, page_size=1)
+
+        with mock.patch.object(store, "_build_kvcr") as build_kvcr:
+            store.register_mem_pool_host(anchor)
+
+        self.assertIs(store.mem_pool_host, anchor)
+        self.assertTrue(store._logical_anchor)
+        self.assertIsNone(store._kvcr)
+        build_kvcr.assert_not_called()
+
+    def test_finalize_passes_the_complete_physical_plan_to_the_builder(self):
+        store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None, page_size=1)
+        c4_buffer = torch.empty(4, dtype=torch.uint8)
+        c4_pool = SimpleNamespace(
+            kv_buffer=c4_buffer,
+            page_size=1,
+            get_page_buffer_meta=lambda indices: (
+                [c4_buffer.data_ptr() + int(index) for index in indices],
+                [1] * len(indices),
+            ),
+        )
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(c4_pool, PoolName.DEEPSEEK_V4_C4)
+
+        with mock.patch.object(store, "_build_hybrid_kvcr") as build:
+            store.finalize_mem_pool_registration()
+
+        build.assert_called_once_with()
+        self.assertEqual(set(store._pool_contexts), {PoolName.DEEPSEEK_V4_C4})
+        self.assertIsNone(store._kvcr)
+
+    def test_single_pool_finalization_does_not_rebuild_an_eager_core(self):
+        store = _store(0, 1)
+        buffer = torch.empty(4, dtype=torch.uint8)
+        page_meta = mock.Mock(
+            side_effect=lambda indices: (
+                [buffer.data_ptr() + int(index) for index in indices],
+                [1] * len(indices),
+            )
+        )
+        pool = SimpleNamespace(
+            page_size=1,
+            kv_buffer=buffer,
+            get_page_buffer_meta=page_meta,
+        )
+
+        def build_once(mem_pool_host):
+            self.assertIs(mem_pool_host, pool)
+            store._kvcr = object()
+
+        with mock.patch.object(store, "_build_kvcr", side_effect=build_once) as build:
+            store.register_mem_pool_host(pool)
+            store.finalize_mem_pool_registration()
+            store.finalize_mem_pool_registration()
+
+        build.assert_called_once_with(pool)
+        page_meta.assert_not_called()
+        self.assertEqual(store._pool_contexts, {})
+
+    def test_late_anchor_replacement_cannot_change_the_started_topology(self):
+        store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None)
+        store.register_mem_pool_host(anchor)
+        store._kvcr = object()
+
+        # Repeating the exact registration is harmless.
+        store.register_mem_pool_host(anchor)
+
+        replacement = SimpleNamespace(kv_buffer=None)
+        with self.assertRaisesRegex(RuntimeError, "after KVCR initialization"):
+            store.register_mem_pool_host(replacement)
+
+        self.assertIs(store.mem_pool_host, anchor)
 
     def test_a_per_layer_pool_refuses_to_start_the_backend(self):
         """A pool with no single kv_buffer tensor cannot be NIXL-registered.
@@ -427,6 +663,47 @@ class UnusableHostPoolTest(unittest.TestCase):
 
         self.assertIn("local DRAM tier", str(raised.exception))
 
+    def test_single_pool_capacity_rounds_down_to_complete_pages(self):
+        store = _store(0, 1, local_dram_slots=5)
+
+        local_dram = store._local_dram_region(self._two_component_pool())
+
+        self.assertEqual(store._slot_size, 8)
+        self.assertEqual(store._segments_per_page, 2)
+        self.assertEqual(local_dram.pools[0][0], "")
+        self.assertEqual(local_dram.pools[0][1], store._local_dram_buffer.data_ptr())
+        # Five component slots contain only two complete two-component pages.
+        self.assertEqual(local_dram.pools[0][2], 4 * 8)
+
+    def test_api_only_runtime_is_rejected_before_composite_tier_allocation(self):
+        store = _store(0, 1, local_dram_slots=5)
+        pool = self._two_component_pool()
+
+        with (
+            mock.patch.object(
+                kvcr_store,
+                "_require_kvcr_composite_runtime",
+                side_effect=RuntimeError("API-only KVCR"),
+            ),
+            mock.patch.object(kvcr_store.torch, "empty") as allocate,
+            self.assertRaisesRegex(RuntimeError, "API-only KVCR"),
+        ):
+            store._local_dram_region(pool)
+
+        allocate.assert_not_called()
+
+    def test_single_pool_refuses_a_budget_smaller_than_one_complete_page(self):
+        for config in (
+            {"local_dram_slots": 1},
+            {"local_dram_slots": 0, "local_dram_bytes": 15},
+        ):
+            with self.subTest(config=config):
+                store = _store(0, 1, **config)
+                with self.assertRaisesRegex(
+                    RuntimeError, "cannot hold one complete KV page"
+                ):
+                    store._local_dram_region(self._two_component_pool())
+
 
 @_needs_kvcr
 class SidecarPoolTest(unittest.TestCase):
@@ -438,8 +715,9 @@ class SidecarPoolTest(unittest.TestCase):
     anchor pool -- so a sidecar transfer moves KV bytes into KV pages, reports
     success, and leaves the sidecar untouched. ``True`` for a page never written
     makes ``_sync_and_clamp_prefetch_result`` skip the clamp and the model attends
-    over an indexer page holding KV bytes. Every entry point -- registration, get,
-    set, exists -- must score the pool a miss on its own.
+    over an indexer page holding KV bytes. Registration now records the topology
+    for deferred construction. The data entry points must still score the pool as
+    a miss until they can address its own memory and key namespace.
     """
 
     def _store_with_core(self) -> KVCRStore:
@@ -459,14 +737,18 @@ class SidecarPoolTest(unittest.TestCase):
             ),
         ]
 
-    def test_registering_a_sidecar_pool_refuses_to_start_the_backend(self):
-        """Rejecting at startup is what turns wrong output into a failed launch."""
+    def test_registering_a_sidecar_records_it_without_enabling_io(self):
         store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None)
+        sidecar = SimpleNamespace()
+        store.register_mem_pool_host(anchor)
 
-        with self.assertRaises(RuntimeError) as raised:
-            store.register_mem_host_pool_v2(SimpleNamespace(), PoolName.INDEXER)
+        with mock.patch.object(store, "_build_kvcr") as build_kvcr:
+            store.register_mem_host_pool_v2(sidecar, PoolName.INDEXER)
 
-        self.assertIn("indexer", str(raised.exception))
+        self.assertIs(store.registered_pools[PoolName.INDEXER], sidecar)
+        self.assertIsNone(store._kvcr)
+        build_kvcr.assert_not_called()
 
     def test_a_sidecar_get_is_a_miss_and_never_reaches_the_core(self):
         """Asserting the deliver never ran separates this guard from
@@ -475,7 +757,8 @@ class SidecarPoolTest(unittest.TestCase):
         store = self._store_with_core()
         delivered = []
 
-        def record_and_succeed(transfer, request_id):
+        def record_and_succeed(transfer, request_id, *, local_only=False):
+            self.assertFalse(local_only)
             delivered.append(transfer.name)
             return [True] * len(transfer.keys)
 
@@ -502,16 +785,962 @@ class SidecarPoolTest(unittest.TestCase):
         self.assertEqual(result.extra_pool_hit_pages, {})
 
 
+class _ManifestPool:
+    """Small physical host pool with page-major component metadata."""
+
+    def __init__(self, page_size: int, component_bytes: List[int]) -> None:
+        self.page_size = page_size
+        self.buffers = [
+            torch.empty(size * 4, dtype=torch.uint8) for size in component_bytes
+        ]
+        self.kv_buffer = self.buffers if len(self.buffers) > 1 else self.buffers[0]
+        self.component_bytes = list(component_bytes)
+        self.meta_calls = 0
+        self.pointer_delta = 0
+
+    def get_hybrid_pool_buffer(self):
+        return self.buffers
+
+    def get_page_buffer_meta(self, indices):
+        self.meta_calls += 1
+        rows = indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+        ptrs = []
+        sizes = []
+        for row in rows.tolist():
+            for buffer, size in zip(self.buffers, self.component_bytes):
+                ptrs.append(buffer.data_ptr() + row * size + self.pointer_delta)
+                sizes.append(size)
+        return ptrs, sizes
+
+
+@_needs_kvcr
+class HybridPoolManifestTest(unittest.TestCase):
+    """Validated pool metadata and named KVCR allocator pools."""
+
+    def setUp(self) -> None:
+        self.store = _store(0, 1)
+        self.anchor = SimpleNamespace(
+            kv_buffer=None,
+            page_size=2,
+            get_page_buffer_meta=mock.Mock(
+                side_effect=AssertionError("logical anchor")
+            ),
+        )
+        self.c4 = _ManifestPool(page_size=2, component_bytes=[8, 8])
+        self.c128 = _ManifestPool(page_size=2, component_bytes=[24])
+        self.store.register_mem_pool_host(self.anchor)
+        self.store.register_mem_host_pool_v2(self.anchor, PoolName.KV)
+        self.store.register_mem_host_pool_v2(self.c4, PoolName.DEEPSEEK_V4_C4)
+        self.store.register_mem_host_pool_v2(self.c128, PoolName.DEEPSEEK_V4_C128)
+
+    def _collect(self):
+        self.store._pool_contexts = self.store._collect_pool_contexts()
+        self.store._freeze_hybrid_key_namespace()
+        return self.store._pool_contexts
+
+    def _hybrid_page_key(
+        self,
+        *,
+        tp_rank=0,
+        tp_size=1,
+        dp_rank=0,
+        dp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        is_mla_model=False,
+        cache_abi="test-cache-abi",
+        page_first=True,
+        logical_page_size=2,
+        c4_page_size=2,
+        c4_components=(8, 8),
+    ):
+        store = _store(
+            tp_rank,
+            tp_size,
+            dp_rank,
+            dp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
+            is_mla_model=is_mla_model,
+            cache_abi=cache_abi,
+        )
+        store._storage_config.is_page_first_layout = page_first
+        anchor = SimpleNamespace(kv_buffer=None, page_size=logical_page_size)
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(
+            _ManifestPool(c4_page_size, list(c4_components)),
+            PoolName.DEEPSEEK_V4_C4,
+        )
+        store.register_mem_host_pool_v2(
+            _ManifestPool(2, [24]), PoolName.DEEPSEEK_V4_C128
+        )
+        store._pool_contexts = store._collect_pool_contexts()
+        store._freeze_hybrid_key_namespace()
+        return store._pool_page_key("0123456789abcdefdeadbeef", PoolName.DEEPSEEK_V4_C4)
+
+    def test_remote_hybrid_requires_an_explicit_cache_abi(self):
+        for cache_abi in (None, "", "   "):
+            with self.subTest(cache_abi=cache_abi):
+                store = _store(0, 1, cache_abi=cache_abi)
+                anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+                store.register_mem_pool_host(anchor)
+                store.register_mem_host_pool_v2(anchor, PoolName.KV)
+                store.register_mem_host_pool_v2(
+                    _ManifestPool(2, [8]), PoolName.DEEPSEEK_V4_C4
+                )
+
+                with (
+                    mock.patch.object(store, "_build_hybrid_kvcr"),
+                    self.assertRaisesRegex(RuntimeError, "cache_abi"),
+                ):
+                    store.finalize_mem_pool_registration()
+
+    def test_hybrid_key_namespace_is_shared_only_by_compatible_ranks(self):
+        baseline = self._hybrid_page_key(dp_rank=0, dp_size=2)
+
+        self.assertEqual(baseline, self._hybrid_page_key(dp_rank=1, dp_size=2))
+        self.assertEqual(baseline, self._hybrid_page_key(dp_rank=0, dp_size=4))
+        incompatible = {
+            "cache ABI": self._hybrid_page_key(cache_abi="other-cache-abi"),
+            "TP size": self._hybrid_page_key(tp_rank=0, tp_size=2),
+            "TP rank": self._hybrid_page_key(tp_rank=1, tp_size=2),
+            "CP size": self._hybrid_page_key(attn_cp_rank=0, attn_cp_size=2),
+            "CP rank": self._hybrid_page_key(attn_cp_rank=1, attn_cp_size=2),
+            "layout": self._hybrid_page_key(page_first=False),
+            "logical page": self._hybrid_page_key(logical_page_size=4),
+            "pool page": self._hybrid_page_key(c4_page_size=4),
+            "component manifest": self._hybrid_page_key(c4_components=(8, 16)),
+        }
+        for field, key in incompatible.items():
+            with self.subTest(field=field):
+                self.assertNotEqual(baseline, key)
+
+        self.assertIn(b"#v5/", baseline)
+
+    def test_dsv4_rank_replicas_share_the_tp0_component_keys(self):
+        tp0 = self._hybrid_page_key(tp_rank=0, tp_size=4, is_mla_model=True)
+        tp3 = self._hybrid_page_key(tp_rank=3, tp_size=4, is_mla_model=True)
+
+        self.assertEqual(tp0, tp3)
+
+    def test_dsv4_rank_replicas_dial_tp0_of_the_matching_cp_slice(self):
+        store = _store(
+            3,
+            4,
+            dp_size=2,
+            attn_cp_rank=1,
+            attn_cp_size=2,
+            is_mla_model=True,
+        )
+        anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(_ManifestPool(2, [8]), PoolName.DEEPSEEK_V4_C4)
+        store._pool_contexts = store._collect_pool_contexts()
+        store._freeze_hybrid_key_namespace()
+
+        hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+
+        self.assertEqual(hint.source_control_endpoint, "tcp://10.0.0.7:25004")
+
+    def test_every_dsv4_tp_lookup_resolves_to_the_single_depositor(self):
+        pool_names = (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        )
+        stores = []
+        owner_addresses = set()
+        for rank in range(2):
+            store = _store(rank, 2, is_mla_model=True)
+            anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+            store.register_mem_pool_host(anchor)
+            store.register_mem_host_pool_v2(anchor, PoolName.KV)
+            store.register_mem_host_pool_v2(
+                _ManifestPool(2, [8]), PoolName.DEEPSEEK_V4_C4
+            )
+            store._pool_contexts = store._collect_pool_contexts()
+            store._freeze_hybrid_key_namespace()
+            stores.append(store)
+
+            controller = object.__new__(HybridCacheController)
+            controller.backup_skip = rank != 0
+            controller.storage_backend_type = "kvcr"
+            controller.mem_pool_host = SimpleNamespace(entry_map={})
+            if all(
+                controller.should_backup(PoolTransfer(name=name)) for name in pool_names
+            ):
+                owner_addresses.add(
+                    (
+                        f"tcp://10.0.0.7:{store._control_port()}",
+                        store._pool_page_key(
+                            "0123456789abcdefdeadbeef",
+                            PoolName.DEEPSEEK_V4_C4,
+                        ),
+                    )
+                )
+
+        self.assertEqual(len(owner_addresses), 1)
+        for store in stores:
+            hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+            target_address = (
+                hint.source_control_endpoint,
+                store._pool_page_key(
+                    "0123456789abcdefdeadbeef", PoolName.DEEPSEEK_V4_C4
+                ),
+            )
+            self.assertIn(target_address, owner_addresses)
+
+        # Do not generalize the DSV4 rule to Kimi's TP-sharded Mamba state.
+        self.assertTrue(controller.should_backup(PoolTransfer(name=PoolName.MAMBA)))
+
+    def test_rank_sharded_mamba_hybrid_still_dials_the_matching_tp_rank(self):
+        store = _store(
+            3,
+            4,
+            dp_size=2,
+            attn_cp_rank=1,
+            attn_cp_size=2,
+            is_mla_model=True,
+        )
+        anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(_ManifestPool(2, [8]), PoolName.MAMBA)
+        store._pool_contexts = store._collect_pool_contexts()
+        store._freeze_hybrid_key_namespace()
+
+        hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+
+        self.assertEqual(hint.source_control_endpoint, "tcp://10.0.0.7:25007")
+
+    def test_logical_anchor_v1_io_and_existence_are_virtual_successes(self):
+        self.store._kvcr = _ExplodingKVCR()
+        keys = ["p0", "p1"]
+        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+
+        self.assertEqual(self.store.batch_set_v1(keys, indices), [True, True])
+        self.assertEqual(self.store.batch_get_v1(keys, indices), [True, True])
+        self.assertEqual(self.store.batch_exists(keys), 2)
+        self.anchor.get_page_buffer_meta.assert_not_called()
+
+    def test_manifest_skips_the_logical_anchor_and_keeps_every_buffer(self):
+        contexts = self._collect()
+
+        self.assertEqual(
+            list(contexts),
+            [PoolName.DEEPSEEK_V4_C128, PoolName.DEEPSEEK_V4_C4],
+        )
+        self.assertEqual(
+            contexts[PoolName.DEEPSEEK_V4_C4].buffers,
+            tuple(self.c4.buffers),
+        )
+        self.assertEqual(len(contexts[PoolName.DEEPSEEK_V4_C4].regions), 2)
+        self.assertEqual(
+            contexts[PoolName.DEEPSEEK_V4_C4].component_sizes,
+            (8, 8),
+        )
+        self.anchor.get_page_buffer_meta.assert_not_called()
+
+    def test_finalizer_builds_named_pools_from_the_complete_manifest(self):
+        store = _store(0, 1, local_dram_bytes=80)
+        store.register_mem_pool_host(self.anchor)
+        store.register_mem_host_pool_v2(self.anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(self.c4, PoolName.DEEPSEEK_V4_C4)
+        store.register_mem_host_pool_v2(self.c128, PoolName.DEEPSEEK_V4_C128)
+
+        with (
+            mock.patch.object(kvcr_store, "_require_kvcr_api"),
+            mock.patch.object(kvcr_store, "_ephemeral_port", return_value=26000),
+            mock.patch.object(kvcr_store, "ZmqPeerControlChannel"),
+            mock.patch.object(kvcr_store, "KVCR") as constructor,
+            mock.patch.object(store, "_start_source_pump") as start_pump,
+        ):
+            store.finalize_mem_pool_registration()
+            store.finalize_mem_pool_registration()
+
+        constructor.assert_called_once()
+        start_pump.assert_called_once()
+        config = constructor.call_args.args[0]
+        backend = constructor.call_args.args[2]
+        self.assertEqual(
+            config.pool_layouts,
+            [
+                ("deepseek_v4_c128:24", 24),
+                ("deepseek_v4_c4:8", 8),
+            ],
+        )
+        self.assertIsNone(backend.framework_dram)
+        self.assertEqual(
+            {
+                (region.address, region.length)
+                for region in backend.framework_dram_regions
+            },
+            {
+                (buffer.data_ptr(), buffer.numel() * buffer.element_size())
+                for buffer in (*self.c4.buffers, *self.c128.buffers)
+            },
+        )
+        self.assertIsNotNone(backend.local_dram)
+        pools = {
+            name: (address, length)
+            for name, address, length in backend.local_dram.pools
+        }
+        self.assertEqual(
+            {name: length for name, (_address, length) in pools.items()},
+            {"deepseek_v4_c128:24": 48, "deepseek_v4_c4:8": 32},
+        )
+        self.assertEqual(
+            {name: address for name, (address, _length) in pools.items()},
+            {
+                name: buffer.data_ptr()
+                for name, buffer in store._local_dram_buffers.items()
+            },
+        )
+        self.assertEqual(
+            set(store._pool_contexts),
+            {PoolName.DEEPSEEK_V4_C4, PoolName.DEEPSEEK_V4_C128},
+        )
+        self.assertIs(store._kvcr, constructor.return_value)
+        self.assertEqual(self.c4.meta_calls, 1)
+        self.assertEqual(self.c128.meta_calls, 1)
+
+    def test_pr19_api_only_runtime_is_rejected_before_hybrid_allocation(self):
+        with (
+            mock.patch.object(
+                kvcr_store,
+                "KVCRBackendConfigs",
+                SimpleNamespace(__dataclass_fields__={}),
+            ),
+            mock.patch.object(kvcr_store.torch, "empty") as allocate,
+            mock.patch.object(kvcr_store, "KVCR") as constructor,
+            self.assertRaisesRegex(RuntimeError, "#19 provides.*foundation"),
+        ):
+            self.store.finalize_mem_pool_registration()
+
+        allocate.assert_not_called()
+        constructor.assert_not_called()
+
+    def test_equal_sizes_in_different_physical_pools_keep_separate_capacity(self):
+        store = _store(0, 1, local_dram_bytes=48)
+        c128_same_size = _ManifestPool(page_size=2, component_bytes=[8])
+        store.register_mem_pool_host(self.anchor)
+        store.register_mem_host_pool_v2(self.anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(self.c4, PoolName.DEEPSEEK_V4_C4)
+        store.register_mem_host_pool_v2(c128_same_size, PoolName.DEEPSEEK_V4_C128)
+
+        with (
+            mock.patch.object(kvcr_store, "_require_kvcr_api"),
+            mock.patch.object(kvcr_store, "_ephemeral_port", return_value=26000),
+            mock.patch.object(kvcr_store, "ZmqPeerControlChannel"),
+            mock.patch.object(kvcr_store, "KVCR") as constructor,
+            mock.patch.object(store, "_start_source_pump"),
+        ):
+            store.finalize_mem_pool_registration()
+
+        config = constructor.call_args.args[0]
+        backend = constructor.call_args.args[2]
+        self.assertEqual(
+            config.pool_layouts,
+            [
+                ("deepseek_v4_c128:8", 8),
+                ("deepseek_v4_c4:8", 8),
+            ],
+        )
+        self.assertEqual(
+            {name: length for name, _address, length in backend.local_dram.pools},
+            {"deepseek_v4_c128:8": 16, "deepseek_v4_c4:8": 32},
+        )
+
+    def test_late_pool_registration_cannot_change_the_started_topology(self):
+        self.store._kvcr = object()
+
+        # An idempotent repeat from the controller is harmless.
+        self.store.register_mem_host_pool_v2(
+            self.c4,
+            PoolName.DEEPSEEK_V4_C4,
+        )
+
+        replacement = _ManifestPool(page_size=2, component_bytes=[8, 8])
+        with self.assertRaisesRegex(RuntimeError, "after KVCR initialization"):
+            self.store.register_mem_host_pool_v2(
+                replacement,
+                PoolName.DEEPSEEK_V4_C4,
+            )
+        with self.assertRaisesRegex(RuntimeError, "after KVCR initialization"):
+            self.store.register_mem_host_pool_v2(
+                replacement,
+                PoolName.INDEXER,
+            )
+
+        self.assertIs(
+            self.store.registered_pools[PoolName.DEEPSEEK_V4_C4],
+            self.c4,
+        )
+        self.assertNotIn(PoolName.INDEXER, self.store.registered_pools)
+
+    def test_a_bufferless_side_pool_is_not_silently_omitted(self):
+        self.store.register_mem_host_pool_v2(
+            SimpleNamespace(kv_buffer=None),
+            PoolName.INDEXER,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "physical pool indexer"):
+            self.store._collect_pool_contexts()
+
+    def test_pool_page_keys_are_pool_qualified_but_hints_still_cover_them(self):
+        self._collect()
+        page = "0123456789abcdefdeadbeef"
+
+        c4_key = self.store._pool_page_key(page, PoolName.DEEPSEEK_V4_C4)
+        c128_key = self.store._pool_page_key(page, PoolName.DEEPSEEK_V4_C128)
+        kv_key = self.store._pool_page_key(page)
+        hint = RouterHint(
+            source_control_endpoint="tcp://127.0.0.1:25000",
+            block_hashes=(page[:16],),
+        )
+
+        self.assertNotEqual(c4_key, c128_key)
+        self.assertEqual(kv_key, f"{page}#v5/kv".encode())
+        payload = hint.to_kvcr_hint(message_id="test-request")["actions"][0]["payload"]
+        hinted_hashes = frozenset(payload["block_hashes"])
+        self.assertIn(self.store._key_adapter.decode(c4_key), hinted_hashes)
+        self.assertIn(self.store._key_adapter.decode(c128_key), hinted_hashes)
+
+    def test_descriptors_resolve_the_transfer_pool_and_its_geometry(self):
+        self._collect()
+        # Ignore the one probe call made while constructing each context.
+        c4_calls = self.c4.meta_calls
+        c128_calls = self.c128.meta_calls
+        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+
+        c4_descriptors, c4_page_keys = self.store._host_descriptors(
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4,
+                keys=["p0", "p1"],
+                host_indices=indices,
+            )
+        )
+        c128_descriptors, c128_page_keys = self.store._host_descriptors(
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128,
+                keys=["p0", "p1"],
+                host_indices=indices,
+            )
+        )
+
+        self.assertEqual(self.c4.meta_calls, c4_calls + 1)
+        self.assertEqual(self.c128.meta_calls, c128_calls + 1)
+        self.anchor.get_page_buffer_meta.assert_not_called()
+        self.assertEqual(c4_page_keys, list(c4_descriptors))
+        self.assertEqual(c128_page_keys, list(c128_descriptors))
+        self.assertEqual(
+            [len(page_descriptors) for page_descriptors in c4_descriptors.values()],
+            [2, 2],
+        )
+        self.assertEqual(
+            [len(page_descriptors) for page_descriptors in c128_descriptors.values()],
+            [1, 1],
+        )
+        self.assertEqual(
+            {
+                desc.size
+                for page_descriptors in c4_descriptors.values()
+                for desc in page_descriptors
+            },
+            {8},
+        )
+        self.assertEqual(
+            {
+                desc.size
+                for page_descriptors in c128_descriptors.values()
+                for desc in page_descriptors
+            },
+            {24},
+        )
+        self.assertEqual(
+            {
+                desc.info
+                for page_descriptors in c4_descriptors.values()
+                for desc in page_descriptors
+            },
+            {"deepseek_v4_c4:8"},
+        )
+        self.assertEqual(
+            {
+                desc.info
+                for page_descriptors in c128_descriptors.values()
+                for desc in page_descriptors
+            },
+            {"deepseek_v4_c128:24"},
+        )
+        self.assertTrue(
+            all(
+                b"#v5/" in key and key.endswith(b"/deepseek_v4_c4")
+                for key in c4_descriptors
+            )
+        )
+        self.assertTrue(
+            all(
+                b"#v5/" in key and key.endswith(b"/deepseek_v4_c128")
+                for key in c128_descriptors
+            )
+        )
+
+    def test_local_hybrid_set_folds_atomic_results_per_pool_page(self):
+        self._collect()
+        submitted = []
+
+        def deposit(descriptors):
+            submitted.append(dict(descriptors))
+            return len(submitted)
+
+        self.store._kvcr = SimpleNamespace(deposit=deposit)
+        failed_key = self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C4)
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {key: True for key in submitted[-1] if key != failed_key}
+
+        self.store._submit_and_wait = submit_and_complete
+        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        results = self.store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["p0", "p1"],
+                    host_indices=indices,
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=["p0", "p1"],
+                    host_indices=indices,
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            results,
+            {
+                str(PoolName.DEEPSEEK_V4_C4): [True, False],
+                str(PoolName.DEEPSEEK_V4_C128): [True, True],
+            },
+        )
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(len(submitted[0]), 2)
+        self.assertEqual(
+            {desc.size for value in submitted[0].values() for desc in value}, {8}
+        )
+        self.assertEqual({len(value) for value in submitted[0].values()}, {2})
+        self.assertEqual(len(submitted[1]), 2)
+        self.assertEqual(
+            {desc.size for value in submitted[1].values() for desc in value}, {24}
+        )
+        self.assertEqual({len(value) for value in submitted[1].values()}, {1})
+
+    def test_hybrid_get_without_hint_fails_nonresident_components(self):
+        self._collect()
+        page_keys = ["aaaaaaaaaaaaaaaa-p0", "0123456789abcdef-p1"]
+        resident = {
+            self.store._pool_page_key(
+                page_keys[0], PoolName.DEEPSEEK_V4_C4
+            ): QueryStatus.HIT,
+            self.store._pool_page_key(
+                page_keys[1], PoolName.DEEPSEEK_V4_C4
+            ): QueryStatus.MISS,
+        }
+        submitted = []
+
+        def query(keys):
+            return [(resident.get(key, QueryStatus.MISS), None) for key in keys]
+
+        def deliver(destinations, request_id=None):
+            submitted.append((dict(destinations), request_id))
+            return 17
+
+        core = SimpleNamespace(
+            query=query,
+            deliver=deliver,
+            submit_hint=mock.Mock(),
+            discard_hint=mock.Mock(),
+        )
+        self.store._kvcr = core
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {
+                key: resident.get(key) is QueryStatus.HIT for key in submitted[-1][0]
+            }
+
+        self.store._submit_and_wait = submit_and_complete
+        results = self.store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    host_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            results,
+            {str(PoolName.DEEPSEEK_V4_C4): [True, False]},
+        )
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(set(submitted[0][0]), set(resident))
+        self.assertIsNone(submitted[0][1])
+        core.submit_hint.assert_not_called()
+        core.discard_hint.assert_not_called()
+
+    def test_local_hybrid_get_missing_page_completion_fails_the_page(self):
+        self._collect()
+        page_keys = ["p0", "p1"]
+        submitted = []
+
+        def deliver(destinations, request_id=None):
+            submitted.append((dict(destinations), request_id))
+            return 19
+
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.HIT, None)] * len(keys),
+            deliver=deliver,
+        )
+        missing = self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C4)
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {key: True for key in submitted[-1][0] if key != missing}
+
+        self.store._submit_and_wait = submit_and_complete
+        result = self.store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    host_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            result,
+            {str(PoolName.DEEPSEEK_V4_C4): [True, False]},
+        )
+        self.assertEqual(len(submitted[0][0]), 2)
+        self.assertEqual({len(value) for value in submitted[0][0].values()}, {2})
+        self.assertIsNone(submitted[0][1])
+
+    def test_remote_hybrid_get_shares_one_hint_across_physical_pools(self):
+        self._collect()
+        page = "0123456789abcdef-p0"
+        delivered = []
+        core = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.MISS, None)] * len(keys),
+            submit_hint=mock.Mock(),
+            discard_hint=mock.Mock(),
+        )
+
+        def deliver(destinations, request_id=None):
+            delivered.append((dict(destinations), request_id))
+            return len(delivered)
+
+        core.deliver = deliver
+        self.store._kvcr = core
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {key: True for key in delivered[-1][0]}
+
+        self.store._submit_and_wait = submit_and_complete
+        results = self.store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=[page],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=[page],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                ),
+            ],
+            extra_info=_hint_extra_info("tcp://10.0.0.7:25000"),
+        )
+
+        self.assertEqual(
+            results,
+            {
+                str(PoolName.DEEPSEEK_V4_C4): [True],
+                str(PoolName.DEEPSEEK_V4_C128): [True],
+            },
+        )
+        self.assertEqual(len(delivered), 2)
+        request_ids = {request_id for _, request_id in delivered}
+        self.assertEqual(len(request_ids), 1)
+        request_id = request_ids.pop()
+        self.assertIsNotNone(request_id)
+        core.submit_hint.assert_called_once()
+        self.assertEqual(core.submit_hint.call_args.kwargs["request_id"], request_id)
+        core.discard_hint.assert_called_once_with(request_id)
+
+    def test_hinted_hybrid_get_logs_the_pool_to_native_op_mapping(self):
+        self._collect()
+        page_keys = ["p0", "p1"]
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C4,
+            keys=page_keys,
+            host_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+        )
+        delivered = {}
+
+        def deliver(destinations, request_id=None):
+            delivered.update(destinations)
+            self.assertEqual(request_id, "req-7")
+            return 77
+
+        self.store._kvcr = SimpleNamespace(deliver=deliver)
+        self.store._config = SimpleNamespace(enable_telemetry=True)
+
+        def submit_and_complete(submit):
+            handle = submit()
+            first_page = self.store._pool_page_key(
+                page_keys[0], PoolName.DEEPSEEK_V4_C4
+            )
+            return handle, {key: key == first_page for key in delivered}
+
+        self.store._submit_and_wait = submit_and_complete
+        with self.assertLogs(kvcr_store.logger, level="INFO") as captured:
+            result = self.store._deliver_transfer(transfer, request_id="req-7")
+
+        self.assertEqual(result, [True, False])
+        self.assertIn(
+            "KVCRStore hinted transfer op=77 request=req-7 "
+            "pool=deepseek_v4_c4 result=partial pages=1/2 "
+            "components=2/4 bytes=16/32",
+            "\n".join(captured.output),
+        )
+
+    def test_short_local_query_result_is_a_miss(self):
+        self.store._kvcr = SimpleNamespace(query=lambda keys: [(QueryStatus.HIT, None)])
+
+        self.assertFalse(self.store._locally_resident([b"component-0", b"component-1"]))
+
+    def test_local_hybrid_exists_folds_every_pool_page_without_hint(self):
+        self._collect()
+        page_keys = [
+            "aaaaaaaaaaaaaaaa-p0",
+            "0123456789abcdef-p1",
+            "bbbbbbbbbbbbbbbb-p2",
+        ]
+        missing = self.store._pool_page_key(page_keys[1], PoolName.DEEPSEEK_V4_C4)
+
+        def query(keys):
+            return [
+                (QueryStatus.MISS if key == missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+
+        self.store._kvcr = SimpleNamespace(query=query)
+        transfers = [
+            PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, keys=page_keys),
+            PoolTransfer(name=PoolName.DEEPSEEK_V4_C128, keys=page_keys),
+        ]
+        result = self.store.batch_exists_v2(page_keys, transfers)
+
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 3,
+                PoolName.DEEPSEEK_V4_C4: 1,
+                PoolName.DEEPSEEK_V4_C128: 3,
+            },
+        )
+        self.assertEqual(result.restorable_prefix_pages, [1])
+
+    def test_remote_hint_makes_a_hybrid_page_available_in_every_pool(self):
+        self._collect()
+        page_keys = ["0123456789abcdef-p0", "bbbbbbbbbbbbbbbb-p1"]
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.MISS, None)] * len(keys)
+        )
+
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, keys=page_keys),
+                PoolTransfer(name=PoolName.DEEPSEEK_V4_C128, keys=page_keys),
+            ],
+            _hint_extra_info("tcp://10.0.0.7:25000"),
+        )
+
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(result.restorable_prefix_pages, [1])
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 2,
+                PoolName.DEEPSEEK_V4_C4: 1,
+                PoolName.DEEPSEEK_V4_C128: 1,
+            },
+        )
+
+    def test_local_hybrid_exists_intersects_all_and_sparse_trailing_policies(self):
+        self._collect()
+        page_keys = [f"p{i}" for i in range(5)]
+        missing = {
+            self.store._pool_page_key("p3", PoolName.DEEPSEEK_V4_C4),
+            self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C128),
+            self.store._pool_page_key("p3", PoolName.DEEPSEEK_V4_C128),
+        }
+
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [
+                (QueryStatus.MISS if key in missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+        )
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=[page_keys[-1]],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 3)
+        self.assertEqual(result.restorable_prefix_pages, [1, 3])
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 5,
+                PoolName.DEEPSEEK_V4_C4: 3,
+                PoolName.DEEPSEEK_V4_C128: 5,
+            },
+        )
+
+    def test_local_hybrid_trailing_window_can_have_sparse_endpoints(self):
+        self._collect()
+        page_keys = [f"p{i}" for i in range(5)]
+        missing = self.store._pool_page_key("p2", PoolName.DEEPSEEK_V4_C128)
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [
+                (QueryStatus.MISS if key == missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+        )
+
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=page_keys[-2:],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 5)
+        self.assertEqual(result.restorable_prefix_pages, [1, 2, 5])
+
+    def test_local_hybrid_exists_returns_zero_without_a_common_endpoint(self):
+        self._collect()
+        page_keys = ["p0", "p1"]
+        missing = {
+            self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C4),
+            self.store._pool_page_key("p0", PoolName.DEEPSEEK_V4_C128),
+        }
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [
+                (QueryStatus.MISS if key in missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+        )
+
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=[page_keys[-1]],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 0)
+        self.assertEqual(result.restorable_prefix_pages, [])
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 2,
+                PoolName.DEEPSEEK_V4_C4: 1,
+                PoolName.DEEPSEEK_V4_C128: 2,
+            },
+        )
+
+    def test_descriptor_shape_or_address_drift_fails_closed(self):
+        self._collect()
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C128,
+            keys=["p0"],
+            host_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
+
+        self.c128.component_bytes.append(24)
+        self.c128.buffers.append(torch.empty(96, dtype=torch.uint8))
+        self.assertIsNone(self.store._host_descriptors(transfer))
+        self.c128.component_bytes.pop()
+        self.c128.buffers.pop()
+
+        self.c128.component_bytes[0] = 23
+        self.assertIsNone(self.store._host_descriptors(transfer))
+
+        self.c128.component_bytes[0] = 24
+        self.c128.pointer_delta = self.c128.buffers[0].numel()
+        self.assertIsNone(self.store._host_descriptors(transfer))
+
+        unknown = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=["p0"],
+            host_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        self.assertIsNone(self.store._host_descriptors(unknown))
+        self.anchor.get_page_buffer_meta.assert_not_called()
+
+
 @_needs_kvcr
 class UnaddressableParallelismTest(unittest.TestCase):
     """Rank coordinates a KVCR block key cannot encode must fail at startup.
 
-    A block key is ``sha256(token ids)#<segment>`` and a hint carries an endpoint
-    plus page hashes, so nothing on the wire says which model slice produced the
+    A block key names one physical-pool page and a hint carries an endpoint plus
+    page hashes, so nothing on the wire says which model slice produced the
     bytes; ``_rank_port_offset`` separates ``(dp, attn_cp, attn_tp)`` by port
-    instead. Pipeline rank and head splitting have no such separation -- same port
-    *and* same key, so the fetch lands another rank's bytes in pages the model
-    attends over.
+    instead. Pipeline rank and head splitting have no such separation -- same
+    port and same key, so the fetch lands another rank's bytes in pages the
+    model attends over.
     """
 
     def _config(self, **overrides) -> HiCacheStorageConfig:
@@ -557,16 +1786,6 @@ class ConcurrentDrainTest(unittest.TestCase):
 
         self.assertEqual(result, {"seg-a": True})
 
-    def test_timeout_returns_empty_rather_than_raising(self):
-        """A late peer must degrade to a recompute, not kill the prefetch thread.
-
-        _drain_until runs on HiCache's prefetch daemon; an exception there takes
-        out storage prefetching for the whole engine.
-        """
-        result = self.store._drain_until(401, timeout_s=0.05)
-
-        self.assertFalse(result)
-
 
 @_needs_kvcr
 class CloseTest(unittest.TestCase):
@@ -592,7 +1811,10 @@ class CloseTest(unittest.TestCase):
         store, core = self._store_with_pump(wedged.wait)
         self.addCleanup(wedged.set)
 
-        with mock.patch.object(kvcr_store, "_PUMP_JOIN_TIMEOUT_S", 0.05):
+        with (
+            mock.patch.object(kvcr_store, "_PUMP_JOIN_TIMEOUT_S", 0.05),
+            self.assertRaisesRegex(RuntimeError, "source pump did not stop"),
+        ):
             store.close()
 
         self.assertFalse(core.closed)
@@ -600,15 +1822,22 @@ class CloseTest(unittest.TestCase):
         # an already-released handle.
         self.assertIs(store._kvcr, core)
 
+    def test_a_core_close_failure_is_propagated_and_retains_the_core(self):
+        store = _store(0, 1)
+        core = mock.Mock()
+        core.close.side_effect = RuntimeError("native operations still active")
+        store._kvcr = core
+
+        with self.assertRaisesRegex(RuntimeError, "KVCR core did not close"):
+            store.close()
+
+        core.close.assert_called_once_with()
+        self.assertIs(store._kvcr, core)
+
 
 @_needs_kvcr
 class RemoteFailureTest(unittest.TestCase):
-    """A remote source that is slow, gone, or lying must degrade to recompute.
-
-    All three are normal for a P2P cache. Raising out of ``batch_get_v2`` kills the
-    prefetch thread HiCache never restarts, taking down *local* L3 for the life of
-    the process; hanging stalls it just as permanently.
-    """
+    """A late remote source must not outlive its framework destination."""
 
     def setUp(self) -> None:
         self.store = _store(0, 1)
@@ -619,32 +1848,86 @@ class RemoteFailureTest(unittest.TestCase):
         """A PoolTransfer-alike whose host descriptors always resolve."""
         return SimpleNamespace(name=PoolName.KV, keys=keys)
 
-    def test_a_source_that_never_answers_reports_a_miss_rather_than_hanging(self):
-        """``kvcr.abort()`` cancels nothing, so ``_drain_until``'s deadline is all
-        that stands between a dead peer and a permanently wedged prefetch thread.
-        """
-        self.store._kvcr = FakeKVCR()  # finish() is never called
+    def test_remote_timeout_does_not_return_framework_page_before_terminal(self):
+        """The caller retains its page until a late native write is terminal."""
+        core = FakeKVCR()
+        self.store._kvcr = core
+        self.store._config = SimpleNamespace(get_timeout_s=0.05)
+        page = bytearray(b"before")
         self.store._host_descriptors = lambda transfer: (
-            {"seg-a": object()},
-            [["seg-a"]],
+            {"page-a": [page]},
+            ["page-a"],
         )
+        result = {}
 
-        started = time.monotonic()
-        results = self.store._deliver_transfer(
-            self._transfer(["page-a"]), request_id="req-1"
+        def deliver():
+            result["pages"] = self.store._deliver_transfer(
+                self._transfer(["page-a"]), request_id="req-1"
+            )
+
+        thread = threading.Thread(target=deliver)
+        thread.start()
+        self.assertTrue(core.submitted.wait(timeout=1.0))
+
+        self.assertTrue(
+            _wait_until(
+                lambda: self.store.stats().get("op_overdue_waiting_terminal", 0) == 1
+            )
         )
-        elapsed = time.monotonic() - started
+        self.assertTrue(thread.is_alive())
+        self.assertIn(core.last_handle, self.store._waiting_ops)
+        self.assertEqual(self.store.stats()["op_overdue_waiting_terminal"], 1)
 
-        self.assertEqual(results, [False])
-        # Bounded by the configured get timeout, not by the caller giving up.
-        self.assertLess(elapsed, self.store._config.get_timeout_s + 5.0)
+        # Model a DMA that lands after the wall-clock budget, then its terminal
+        # completion. HiCache must not be able to reuse the page between them.
+        core.last_destinations["page-a"][0][:] = b"late!!"
+        core.finish(core.last_handle, ["page-a"])
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["pages"], [True])
+        page[:] = b"reused"
+        self.assertEqual(page, b"reused")
+
+    def test_poll_fault_after_submit_retains_page_until_terminal(self):
+        """A post-submit polling fault cannot turn a live DMA into a miss."""
+        core = RecoverablePollFaultKVCR()
+        self.store._kvcr = core
+        self.store._config = SimpleNamespace(get_timeout_s=0.05)
+        page = bytearray(b"before")
+        self.store._host_descriptors = lambda transfer: (
+            {"page-a": [page]},
+            ["page-a"],
+        )
+        result = {}
+
+        def deliver():
+            result["pages"] = self.store._deliver_transfer(
+                self._transfer(["page-a"]), request_id="req-1"
+            )
+
+        thread = threading.Thread(target=deliver)
+        thread.start()
+        self.assertTrue(core.submitted.wait(timeout=1.0))
+        self.assertTrue(core.poll_faulted.wait(timeout=1.0))
+
+        self.assertTrue(thread.is_alive())
+        self.assertIn(core.last_handle, self.store._waiting_ops)
+
+        core.last_destinations["page-a"][0][:] = b"late!!"
+        core.finish(core.last_handle, ["page-a"])
+        core.poll_recovered.set()
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["pages"], [True])
 
     def test_a_hint_covering_nothing_leaves_the_prefix_at_zero(self):
         """``batch_exists_v2`` is the gate: the controller allocates host memory
         for the prefix reported here, released only after a full deliver round trip.
         """
         self.store._kvcr = FakeKVCR()
-        self.store._locally_resident = lambda segment_keys: False
+        self.store._locally_resident = lambda block_keys: False
         extra_info = _hint_extra_info("tcp://10.0.0.7:25000")
 
         result = self.store.batch_exists_v2(
@@ -675,8 +1958,8 @@ class RaisingCoreTest(unittest.TestCase):
         self.store._slot_size = 16
         self.store._kvcr = _ExplodingKVCR()
         self.store._host_descriptors = lambda transfer: (
-            {"seg-a": object()},
-            [["seg-a"]],
+            {"page-a": [object()]},
+            ["page-a"],
         )
 
     def _transfer(self, keys: List[str]) -> SimpleNamespace:

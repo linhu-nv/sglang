@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    count_expected_pool_hits,
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
@@ -151,6 +152,7 @@ class HybridCacheController(BaseHiCacheController):
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
+            self.initialize_storage_data_sync_groups()
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
                 prefetch_threshold=prefetch_threshold,
@@ -163,6 +165,15 @@ class HybridCacheController(BaseHiCacheController):
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
 
+    def _register_storage_backend_pools(
+        self, host_pools: Optional[list[PoolEntry]] = None
+    ) -> None:
+        self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+        pools = self.mem_pool_host.entries if host_pools is None else host_pools
+        for entry in pools:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        self.storage_backend.finalize_mem_pool_registration()
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -170,16 +181,16 @@ class HybridCacheController(BaseHiCacheController):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
+        coordinated_lifecycle: bool = False,
     ):
         super().attach_storage_backend(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
+            host_pools=host_pools,
+            coordinated_lifecycle=coordinated_lifecycle,
         )
-
-        for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
@@ -677,8 +688,11 @@ class HybridCacheController(BaseHiCacheController):
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
-            pool_hits = count_pool_hits(results)
+            extra_info = HiCacheStorageExtraInfo(
+                extra_info=_router_hint_extra_info(operation)
+            )
+            results = self.storage_backend.batch_get_v2(transfers_nonkv, extra_info)
+            pool_hits = count_expected_pool_hits(results, transfers_nonkv)
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
