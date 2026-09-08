@@ -130,6 +130,7 @@ class CoreHandoffTest(unittest.TestCase):
         self.assertEqual(action["action_type"], KVCR_FETCH_ACTION_TYPE)
         self.assertEqual(action["action_version"], KVCR_FETCH_ACTION_VERSION)
         self.assertEqual(action["action_id"], "src-0")
+        self.assertNotIn("mode", action["payload"])
 
     def test_bare_payload_uses_request_scoped_identity_fallbacks(self):
         hint = RouterHint.maybe_from_extra_info(

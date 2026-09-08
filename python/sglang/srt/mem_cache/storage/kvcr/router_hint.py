@@ -294,7 +294,6 @@ class RouterHint(msgspec.Struct, kw_only=True):
                     "payload": {
                         "source_control_endpoint": self.source_control_endpoint,
                         "block_hashes": [int(h, 16) for h in self.block_hashes],
-                        "mode": "copy",
                     },
                 }
             ],
