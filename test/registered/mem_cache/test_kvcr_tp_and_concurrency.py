@@ -41,9 +41,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
+    KVCR_FETCH_ACTION_TYPE,
+    KVCR_FETCH_ACTION_VERSION,
     ROUTER_HINT_KEY,
-    SOURCE_LOCATIONS_ACTION_TYPE,
-    SOURCE_LOCATIONS_ACTION_VERSION,
     RouterHint,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -98,6 +98,32 @@ class TestKVCRImports(unittest.TestCase):
             "every real-backend case in this file silently skipped: "
             f"{_KVCR_IMPORT_ERROR}",
         )
+
+    @unittest.skipUnless(_HAS_KVCR, "KVCRStore did not import")
+    def test_composite_runtime_probe_distinguishes_api_only_kvcr(self):
+        with mock.patch.object(
+            kvcr_store,
+            "KVCRBackendConfigs",
+            SimpleNamespace(__dataclass_fields__={}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "#19 provides.*foundation"):
+                kvcr_store._require_kvcr_composite_runtime()
+
+        with mock.patch.object(
+            kvcr_store,
+            "KVCRBackendConfigs",
+            SimpleNamespace(__dataclass_fields__={"framework_dram_regions": object()}),
+        ):
+            kvcr_store._require_kvcr_composite_runtime()
+
+    @unittest.skipUnless(_HAS_KVCR, "KVCRStore did not import")
+    def test_hint_contract_probe_rejects_the_pre_envelope_runtime(self):
+        with mock.patch.object(kvcr_store, "KVCR_ROUTER_HINT_KEY", "router_hint"):
+            with self.assertRaisesRegex(RuntimeError, "versioned kv_hint/kv.fetch"):
+                kvcr_store._require_kvcr_hint_contract()
+
+        with mock.patch.object(kvcr_store, "KVCR_ROUTER_HINT_KEY", "kv_hint"):
+            kvcr_store._require_kvcr_hint_contract()
 
 
 _BASE_CONTROL_PORT = 25000
@@ -186,8 +212,8 @@ def _hint_extra_info(endpoint: str) -> HiCacheStorageExtraInfo:
                 "actions": [
                     {
                         "action_id": "src-0",
-                        "action_type": SOURCE_LOCATIONS_ACTION_TYPE,
-                        "action_version": SOURCE_LOCATIONS_ACTION_VERSION,
+                        "action_type": KVCR_FETCH_ACTION_TYPE,
+                        "action_version": KVCR_FETCH_ACTION_VERSION,
                         "payload": {
                             "source_control_endpoint": endpoint,
                             "block_hashes": ["0123456789abcdef"],
@@ -649,6 +675,23 @@ class UnusableHostPoolTest(unittest.TestCase):
         # Five component slots contain only two complete two-component pages.
         self.assertEqual(local_dram.pools[0][2], 4 * 8)
 
+    def test_api_only_runtime_is_rejected_before_composite_tier_allocation(self):
+        store = _store(0, 1, local_dram_slots=5)
+        pool = self._two_component_pool()
+
+        with (
+            mock.patch.object(
+                kvcr_store,
+                "_require_kvcr_composite_runtime",
+                side_effect=RuntimeError("API-only KVCR"),
+            ),
+            mock.patch.object(kvcr_store.torch, "empty") as allocate,
+            self.assertRaisesRegex(RuntimeError, "API-only KVCR"),
+        ):
+            store._local_dram_region(pool)
+
+        allocate.assert_not_called()
+
     def test_single_pool_refuses_a_budget_smaller_than_one_complete_page(self):
         for config in (
             {"local_dram_slots": 1},
@@ -1068,6 +1111,22 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertEqual(self.c4.meta_calls, 1)
         self.assertEqual(self.c128.meta_calls, 1)
 
+    def test_pr19_api_only_runtime_is_rejected_before_hybrid_allocation(self):
+        with (
+            mock.patch.object(
+                kvcr_store,
+                "KVCRBackendConfigs",
+                SimpleNamespace(__dataclass_fields__={}),
+            ),
+            mock.patch.object(kvcr_store.torch, "empty") as allocate,
+            mock.patch.object(kvcr_store, "KVCR") as constructor,
+            self.assertRaisesRegex(RuntimeError, "#19 provides.*foundation"),
+        ):
+            self.store.finalize_mem_pool_registration()
+
+        allocate.assert_not_called()
+        constructor.assert_not_called()
+
     def test_equal_sizes_in_different_physical_pools_keep_separate_capacity(self):
         store = _store(0, 1, local_dram_bytes=48)
         c128_same_size = _ManifestPool(page_size=2, component_bytes=[8])
@@ -1149,7 +1208,8 @@ class HybridPoolManifestTest(unittest.TestCase):
 
         self.assertNotEqual(c4_key, c128_key)
         self.assertEqual(kv_key, f"{page}#v5/kv".encode())
-        hinted_hashes = frozenset(hint.to_kvcr_hint()["block_hashes"])
+        payload = hint.to_kvcr_hint(message_id="test-request")["actions"][0]["payload"]
+        hinted_hashes = frozenset(payload["block_hashes"])
         self.assertIn(self.store._key_adapter.decode(c4_key), hinted_hashes)
         self.assertIn(self.store._key_adapter.decode(c128_key), hinted_hashes)
 

@@ -71,7 +71,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import msgspec
 import torch
-from kvcr import KVCR, KVCRBindings
+from kvcr import KVCR, ROUTER_HINT_KEY as KVCR_ROUTER_HINT_KEY, KVCRBindings
 from kvcr.config import (
     FrameworkDramInput,
     KVCRBackendConfigs,
@@ -216,6 +216,37 @@ def _require_kvcr_api() -> None:
             f"KVCRStore: the installed nvidia-kvcr is missing {missing}. This "
             "backend tracks the kvcr core's current API; upgrade nvidia-kvcr "
             "or use a SGLang revision matching your kvcr."
+        )
+
+
+def _require_kvcr_composite_runtime() -> None:
+    """Refuse the API-only KVCR release before allocating composite state.
+
+    ai-dynamo/kvcr#19 introduced named layouts and descriptor lists, but its
+    runtime intentionally still accepts only one layout and one descriptor per
+    key. The follow-up runtime adds plural framework-region registration along
+    with atomic composite residency. Its backend-config field is the narrowest
+    feature probe available while nvidia-kvcr remains versioned 0.1.0 across
+    incompatible API revisions.
+    """
+    fields = getattr(KVCRBackendConfigs, "__dataclass_fields__", {})
+    if "framework_dram_regions" not in fields:
+        raise RuntimeError(
+            "KVCRStore composite pages require the KVCR multi-pool runtime; "
+            "ai-dynamo/kvcr#19 provides the descriptor-list API foundation "
+            "but still executes only one descriptor in one pool. Install the "
+            "follow-up multi-pool runtime before enabling this backend."
+        )
+
+
+def _require_kvcr_hint_contract() -> None:
+    """Require the versioned ``kv.fetch`` parser used by this adapter."""
+    if KVCR_ROUTER_HINT_KEY != "kv_hint":
+        raise RuntimeError(
+            "KVCRStore remote hints require KVCR's versioned kv_hint/kv.fetch "
+            "contract. The installed runtime still expects the legacy bare "
+            "router_hint payload; rebase the multi-pool runtime onto current "
+            "KVCR main."
         )
 
 
@@ -480,6 +511,8 @@ class KVCRStore(HiCacheStorage):
         _reject_unaddressable_parallelism(storage_config)
         self._storage_config = storage_config
         self._config = KVCRBackendConfig.from_extra_config(storage_config.extra_config)
+        if self._config.enable_remote_hint:
+            _require_kvcr_hint_contract()
         self.mem_pool_host = mem_pool
 
         # A per-worker unique NIXL agent name and control endpoint. Colocated
@@ -885,6 +918,9 @@ class KVCRStore(HiCacheStorage):
 
     def _build_hybrid_kvcr(self) -> None:
         """Construct KVCR over the validated physical hybrid-pool manifest."""
+        # Fail before reserving the configured KVCR-owned CPU tier. PR #19 has
+        # the public descriptor-list types but cannot execute this topology.
+        _require_kvcr_composite_runtime()
         if not self._pool_contexts:
             raise RuntimeError(
                 "KVCRStore: hybrid host-pool manifest has no data pools."
@@ -955,6 +991,12 @@ class KVCRStore(HiCacheStorage):
         framework_dram_regions: Tuple[FrameworkDramInput, ...] = (),
     ) -> None:
         _require_kvcr_api()
+        if (
+            len(pool_layouts) > 1
+            or framework_dram_regions
+            or (self._segments_per_page or 0) > 1
+        ):
+            _require_kvcr_composite_runtime()
 
         advertise = self._config.control_advertise_host or socket.gethostname()
         self._control = ZmqPeerControlChannel(
@@ -984,16 +1026,27 @@ class KVCRStore(HiCacheStorage):
         )
         # eager_ctrl_connect / opportunistic_query / metadata_retry moved out of
         # KVCRConfig into the remote-forward-DRAM options in the wheel core.
-        backend_configs = KVCRBackendConfigs(
-            framework_dram=framework_dram,
-            local_dram=local_dram,
-            framework_dram_regions=framework_dram_regions,
-            remote_fw_dram=RemoteFWDramOptions(
-                eager_ctrl_connect=self._config.eager_ctrl_connect,
-                opportunistic_query=self._config.opportunistic_query,
-                metadata_retry_interval_ms=self._config.metadata_retry_interval_ms,
-            ),
+        remote_fw_dram = RemoteFWDramOptions(
+            eager_ctrl_connect=self._config.eager_ctrl_connect,
+            opportunistic_query=self._config.opportunistic_query,
+            metadata_retry_interval_ms=self._config.metadata_retry_interval_ms,
         )
+        if framework_dram_regions:
+            backend_configs = KVCRBackendConfigs(
+                framework_dram=framework_dram,
+                local_dram=local_dram,
+                framework_dram_regions=framework_dram_regions,
+                remote_fw_dram=remote_fw_dram,
+            )
+        else:
+            # KVCR #19 intentionally has no plural-region field. Keep the
+            # single-region/single-descriptor path usable with that release;
+            # composite callers were rejected by the capability gate above.
+            backend_configs = KVCRBackendConfigs(
+                framework_dram=framework_dram,
+                local_dram=local_dram,
+                remote_fw_dram=remote_fw_dram,
+            )
         self._kvcr = KVCR(config, bindings, backend_configs)
         self._start_source_pump()
         logger.info(
@@ -1145,6 +1198,10 @@ class KVCRStore(HiCacheStorage):
         segment_bytes, segments_per_page = layout
         self._slot_size = segment_bytes
         self._segments_per_page = segments_per_page
+        if segments_per_page > 1:
+            # Keep the API-only wheel from allocating the whole configured CPU
+            # tier and only then rejecting the first composite operation.
+            _require_kvcr_composite_runtime()
 
         configured_slots = self._config.local_dram_slots
         page_bytes = segment_bytes * segments_per_page
@@ -1577,7 +1634,9 @@ class KVCRStore(HiCacheStorage):
         # does not thread one through extra_info, so we mint our own.
         request_id = self._hint_request_id()
         try:
-            self._kvcr.submit_hint(hint.to_kvcr_hint(), request_id=request_id)
+            self._kvcr.submit_hint(
+                hint.to_kvcr_hint(message_id=request_id), request_id=request_id
+            )
         except Exception:
             self._note_fault("submit_hint")
             return None

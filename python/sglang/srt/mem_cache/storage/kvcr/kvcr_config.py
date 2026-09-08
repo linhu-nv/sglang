@@ -48,10 +48,10 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     enable_telemetry: bool = False
     # Budget for one KVCR operation end to end. The core's own default is 1000ms,
     # which is too tight here: the *source* clamps its pin deadline to this
-    # value, and a single prefetch fans a 64-token page out into many block keys
-    # (192 for a 96-page request), all of which must be pinned and written
-    # before it expires. At 1000ms that reliably force-failed a fetch that had
-    # every key resident on the source.
+    # value, and a single prefetch can carry many composite page records whose
+    # physical components must all be pinned and written before it expires. At
+    # 1000ms that reliably force-failed a fetch that had every key resident on
+    # the source.
     operation_timeout_ms: int = 20000
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False

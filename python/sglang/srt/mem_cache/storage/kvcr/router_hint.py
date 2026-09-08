@@ -16,15 +16,17 @@ typed KV hint contract"), which SGLang RFC #36224 proposes to make a first-class
 request field:
 
     {"protocol_version": "0.1", "message_id": ..., "actions": [
-        {"action_id": ..., "action_type": "kv.source_locations",
+        {"action_id": ..., "action_type": "kv.fetch",
          "action_version": "1.0",
          "payload": {"source_control_endpoint": ..., "block_hashes": [...]}}]}
 
-This backend reads exactly one action type, ``kv.source_locations``, and ignores
-every other action in the envelope -- an envelope carrying actions nobody here
-implements must still deliver the one that is implemented. The bare payload is
-accepted unwrapped as well, which is what dynamo PR #11695 sends today; that
-path retires once #13134 lands on both sides.
+This backend reads the canonical ``kv.fetch@1.0`` action and ignores every
+other action in the envelope -- an envelope carrying actions nobody here
+implements must still deliver the one that is implemented. The legacy
+``kv.source_locations@1.0`` spelling and the pre-envelope bare payload remain
+accepted for rolling upgrades. Before handing a hint to KVCR, the adapter
+rebuilds the canonical envelope because it may have realigned the source port
+to this TP/CP rank.
 
 Until RFC #36224 lands a typed ``KvHints`` struct in SGLang core, the envelope
 arrives as a plain dict and is parsed here. The migration is then a field type
@@ -50,11 +52,24 @@ else:
 # SGLang RFC #36224, so the eventual typed field needs no rename here.
 ROUTER_HINT_KEY = "kv_hints"
 
-# The one action type this backend implements, and the envelope version it was
-# specified against. Both are matched leniently: an unknown envelope version
-# still has its actions read, since an action carries its own version.
+# Canonical action emitted by merged dynamo PR #13134 and consumed by current
+# KVCR. An unknown envelope version is still scanned because every action owns
+# its own version.
+KVCR_HINT_PROTOCOL_VERSION = "0.1"
+KVCR_FETCH_ACTION_TYPE = "kv.fetch"
+KVCR_FETCH_ACTION_VERSION = "1.0"
+
+# Compatibility alias used by the pre-#13134 prototype. Keep accepting it so a
+# rolling Dynamo/SGLang upgrade recomputes neither silently nor unnecessarily.
 SOURCE_LOCATIONS_ACTION_TYPE = "kv.source_locations"
 SOURCE_LOCATIONS_ACTION_VERSION = "1.0"
+
+_SUPPORTED_FETCH_ACTIONS = frozenset(
+    {
+        (KVCR_FETCH_ACTION_TYPE, KVCR_FETCH_ACTION_VERSION),
+        (SOURCE_LOCATIONS_ACTION_TYPE, SOURCE_LOCATIONS_ACTION_VERSION),
+    }
+)
 
 # Width of the canonical block-hash key, in hex chars. See page_hash_key().
 _BLOCK_HASH_HEX_WIDTH = 16
@@ -118,20 +133,15 @@ def normalize_block_hash(value: Union[int, str]) -> Optional[str]:
 
 
 class RouterHint(msgspec.Struct, kw_only=True):
-    """Mirror of the dynamo RouterHint schema (oandreeva/router_hints).
+    """Validated view of Dynamo's ``KvSourceLocationsPayload``.
 
-    Fields intentionally match the *compact* 2-field wire schema on the dynamo
-    branch (PR #11695, head ``b4c9823b81``, "Add compact router hints for remote
-    KV reuse") so this parser stays a thin adapter:
+    Fields intentionally match the two-field ``kv.fetch@1.0`` payload merged in
+    Dynamo PR #13134, so this parser stays a thin adapter:
 
     - source_control_endpoint: ZMQ control endpoint of the peer that holds the
       prefix (host:port). This is what KVCR's control channel connects to.
     - block_hashes: root-aligned block hashes (``block_hashes[i]`` is request
       block ``i``); the target decides which suffix to fetch.
-
-    The earlier ``target_cached_prefix_blocks`` advisory int was dropped from
-    the wire in that PR -- it moved into the router-internal
-    ``RouterHintRootCandidates`` and is no longer sent to the backend.
 
     ``block_hashes`` is stored in the canonical :func:`page_hash_key` form, not
     as it arrived: the dynamo router sends bare u64 numbers while a direct
@@ -147,10 +157,9 @@ class RouterHint(msgspec.Struct, kw_only=True):
     source_control_endpoint: str
     block_hashes: Tuple[str, ...] = ()
     # Derived from block_hashes in __post_init__; never passed in. The core runs
-    # covers() once per block key and one prefetch fans each page out into every
-    # segment, so the set is built once here rather than per call. Keeping it on
-    # the struct (rather than in a keyed cache) makes the lookup independent of
-    # how many hashes the hint carries.
+    # covers() once per block key, so the set is built once here rather than per
+    # call. Keeping it on the struct (rather than in a keyed cache) makes the
+    # lookup independent of how many hashes the hint carries.
     covered_pages: frozenset = frozenset()
 
     def __post_init__(self) -> None:
@@ -180,13 +189,15 @@ class RouterHint(msgspec.Struct, kw_only=True):
 
     @classmethod
     def maybe_from_envelope(cls, envelope) -> Optional[RouterHint]:
-        """Pull the ``kv.source_locations`` payload out of a v0.1 KV-hint envelope.
+        """Pull a supported fetch payload out of a v0.1 KV-hint envelope.
 
         A bare payload (no ``actions`` list) is accepted unwrapped, which is the
-        pre-envelope shape dynamo PR #11695 sends. Actions of other types are
-        skipped rather than rejected: an envelope is a list of independent
-        actions, so one this backend does not implement must not suppress one it
-        does. The first well-formed match wins.
+        pre-envelope shape dynamo PR #11695 sent. ``kv.fetch@1.0`` is the
+        canonical action from merged Dynamo PR #13134; the earlier
+        ``kv.source_locations@1.0`` name remains a rolling-upgrade alias.
+        Actions of other types are skipped rather than rejected: an envelope is
+        a list of independent actions, so one this backend does not implement
+        must not suppress one it does. The first well-formed match wins.
         """
         if not isinstance(envelope, dict):
             return None
@@ -198,11 +209,13 @@ class RouterHint(msgspec.Struct, kw_only=True):
         for action in actions:
             if not isinstance(action, dict):
                 continue
-            if action.get("action_type") != SOURCE_LOCATIONS_ACTION_TYPE:
-                continue
+            action_contract = (
+                action.get("action_type"),
+                action.get("action_version"),
+            )
             # A newer action version may reshape the payload, so parsing it
             # against this schema would silently misread it. Skip instead.
-            if action.get("action_version") != SOURCE_LOCATIONS_ACTION_VERSION:
+            if action_contract not in _SUPPORTED_FETCH_ACTIONS:
                 continue
             hint = cls.maybe_from_payload(action.get("payload"))
             if hint is not None:
@@ -226,29 +239,41 @@ class RouterHint(msgspec.Struct, kw_only=True):
         return cls.maybe_from_envelope(raw.get(ROUTER_HINT_KEY))
 
     def covers(self, key: str) -> bool:
-        """Is this SGLang page key (or one of its segment keys) in the hint?
+        """Is this SGLang page key (or a qualified physical-pool key) hinted?
 
-        Accepts a segment key (``<page hash>#<seg>``) as well as a bare page
-        key, because the KVCR core runs its membership test on the per-segment
-        block identity that :meth:`KVCRStore._segment_key` produced, while the
-        hint only ever names whole pages.
+        Composite KVCR keys append a schema, cache-layout, and physical-pool
+        suffix after ``#``. The router still names the logical page, so only the
+        hash before that delimiter participates in membership.
         """
         return page_hash_key(key.split("#", 1)[0]) in self.covered_pages
 
-    def to_kvcr_hint(self) -> dict:
+    def to_kvcr_hint(self, *, message_id: str) -> dict:
         """This hint in the shape KVCR's own parser accepts.
 
         Since kvcr#14 the core parses the hint and owns membership, so what
-        crosses ``submit_hint`` is a plain dict rather than this struct. Block
+        crosses ``submit_hint`` is a versioned ``kv.fetch`` envelope rather
+        than this struct or the router's ``kv.source_locations`` action. Block
         hashes go over as **unsigned** ints: the core validates them into
         ``0 <= h < 1<<64`` and compares them against ``KeyAdapter.decode``, so
         a signed value here would be rejected outright, and a signed decode on
-        the other side would miss every block without erroring.
+        the other side would miss every block without erroring. ``message_id``
+        is the same request-scoped identifier used for KVCR hint lifetime.
         """
         return {
-            "source_control_endpoint": self.source_control_endpoint,
-            "block_hashes": [int(h, 16) for h in self.block_hashes],
-            "mode": "copy",
+            "protocol_version": KVCR_HINT_PROTOCOL_VERSION,
+            "message_id": message_id,
+            "actions": [
+                {
+                    "action_id": f"{message_id}:fetch",
+                    "action_type": KVCR_FETCH_ACTION_TYPE,
+                    "action_version": KVCR_FETCH_ACTION_VERSION,
+                    "payload": {
+                        "source_control_endpoint": self.source_control_endpoint,
+                        "block_hashes": [int(h, 16) for h in self.block_hashes],
+                        "mode": "copy",
+                    },
+                }
+            ],
         }
 
 
@@ -258,8 +283,8 @@ class StrKeyAdapter:
     The core owns hint membership since kvcr#14: it parses the hint itself into
     a ``frozenset[int]`` and tests ``decode(key) in hashes``, so this adapter
     only translates keys in both directions. ``encode`` maps a framework key
-    (str or bytes) to a KVCR :class:`BlockKey`; ``decode`` maps a *segment* key
-    back to the u64 block hash the router indexed.
+    (str or bytes) to a KVCR :class:`BlockKey`; ``decode`` maps a qualified
+    physical-pool key back to the u64 block hash the router indexed.
 
     Kept torch-free here (alongside :class:`RouterHint`) so the KVCR<->SGLang
     hint contract can be exercised against the real core without importing the

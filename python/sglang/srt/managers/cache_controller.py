@@ -222,7 +222,7 @@ class PrefetchAck:
 
 # Free-form key under HiCacheStorageExtraInfo.extra_info that carries the per-request
 # KV-hint envelope down to storage backends (currently read by the KVCR backend,
-# which implements the kv.source_locations action). Kept as a literal here so this
+# which implements the kv.fetch action). Kept as a literal here so this
 # generic controller stays backend-agnostic; the KVCR backend owns the matching
 # constant, and a test pins the two together.
 _ROUTER_HINT_EXTRA_INFO_KEY = "kv_hints"

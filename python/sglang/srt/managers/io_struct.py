@@ -297,7 +297,7 @@ class GenerateReqInput:
     # only the action types it implements. Shape (protocol 0.1):
     # {"protocol_version", "message_id", "actions": [{"action_id", "action_type",
     #  "action_version", "payload"}]}. Typed in SGLang RFC #36224; the KVCR
-    # backend implements kv.source_locations@1.0 for peer-to-peer prefix reuse.
+    # backend implements kv.fetch@1.0 for peer-to-peer prefix reuse.
     # A hint describes one request's prefix, so a batch carries one envelope
     # per request.
     kv_hints: Optional[Union[List[Optional[dict]], dict]] = None
