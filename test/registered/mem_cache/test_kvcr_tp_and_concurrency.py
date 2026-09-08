@@ -506,6 +506,18 @@ class DPColocationTest(unittest.TestCase):
 class UnusableHostPoolTest(unittest.TestCase):
     """Host pool layouts the backend cannot run against must fail at startup."""
 
+    @staticmethod
+    def _two_component_pool():
+        buffer = torch.empty(32, dtype=torch.uint8)
+        return SimpleNamespace(
+            page_size=2,
+            kv_buffer=buffer,
+            get_page_buffer_meta=lambda _indices: (
+                [buffer.data_ptr(), buffer.data_ptr() + 8],
+                [8, 8],
+            ),
+        )
+
     def test_logical_anchor_defers_core_construction(self):
         store = _store(0, 1)
         anchor = SimpleNamespace(kv_buffer=None, page_size=1)
@@ -625,6 +637,30 @@ class UnusableHostPoolTest(unittest.TestCase):
 
         self.assertIn("local DRAM tier", str(raised.exception))
 
+    def test_single_pool_capacity_rounds_down_to_complete_pages(self):
+        store = _store(0, 1, local_dram_slots=5)
+
+        local_dram = store._local_dram_region(self._two_component_pool())
+
+        self.assertEqual(store._slot_size, 8)
+        self.assertEqual(store._segments_per_page, 2)
+        self.assertEqual(local_dram.pools[0][0], "")
+        self.assertEqual(local_dram.pools[0][1], store._local_dram_buffer.data_ptr())
+        # Five component slots contain only two complete two-component pages.
+        self.assertEqual(local_dram.pools[0][2], 4 * 8)
+
+    def test_single_pool_refuses_a_budget_smaller_than_one_complete_page(self):
+        for config in (
+            {"local_dram_slots": 1},
+            {"local_dram_slots": 0, "local_dram_bytes": 15},
+        ):
+            with self.subTest(config=config):
+                store = _store(0, 1, **config)
+                with self.assertRaisesRegex(
+                    RuntimeError, "cannot hold one complete KV page"
+                ):
+                    store._local_dram_region(self._two_component_pool())
+
 
 @_needs_kvcr
 class SidecarPoolTest(unittest.TestCase):
@@ -736,7 +772,7 @@ class _ManifestPool:
 
 @_needs_kvcr
 class HybridPoolManifestTest(unittest.TestCase):
-    """Validated pool metadata, before plural KVCR arenas are enabled."""
+    """Validated pool metadata and named KVCR allocator pools."""
 
     def setUp(self) -> None:
         self.store = _store(0, 1)
@@ -759,7 +795,7 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.store._freeze_hybrid_key_namespace()
         return self.store._pool_contexts
 
-    def _component_key(
+    def _hybrid_page_key(
         self,
         *,
         tp_rank=0,
@@ -798,9 +834,7 @@ class HybridPoolManifestTest(unittest.TestCase):
         )
         store._pool_contexts = store._collect_pool_contexts()
         store._freeze_hybrid_key_namespace()
-        return store._segment_key(
-            "0123456789abcdefdeadbeef", 0, PoolName.DEEPSEEK_V4_C4
-        )
+        return store._pool_page_key("0123456789abcdefdeadbeef", PoolName.DEEPSEEK_V4_C4)
 
     def test_remote_hybrid_requires_an_explicit_cache_abi(self):
         for cache_abi in (None, "", "   "):
@@ -820,30 +854,30 @@ class HybridPoolManifestTest(unittest.TestCase):
                     store.finalize_mem_pool_registration()
 
     def test_hybrid_key_namespace_is_shared_only_by_compatible_ranks(self):
-        baseline = self._component_key(dp_rank=0, dp_size=2)
+        baseline = self._hybrid_page_key(dp_rank=0, dp_size=2)
 
-        self.assertEqual(baseline, self._component_key(dp_rank=1, dp_size=2))
-        self.assertEqual(baseline, self._component_key(dp_rank=0, dp_size=4))
+        self.assertEqual(baseline, self._hybrid_page_key(dp_rank=1, dp_size=2))
+        self.assertEqual(baseline, self._hybrid_page_key(dp_rank=0, dp_size=4))
         incompatible = {
-            "cache ABI": self._component_key(cache_abi="other-cache-abi"),
-            "TP size": self._component_key(tp_rank=0, tp_size=2),
-            "TP rank": self._component_key(tp_rank=1, tp_size=2),
-            "CP size": self._component_key(attn_cp_rank=0, attn_cp_size=2),
-            "CP rank": self._component_key(attn_cp_rank=1, attn_cp_size=2),
-            "layout": self._component_key(page_first=False),
-            "logical page": self._component_key(logical_page_size=4),
-            "pool page": self._component_key(c4_page_size=4),
-            "component manifest": self._component_key(c4_components=(8, 16)),
+            "cache ABI": self._hybrid_page_key(cache_abi="other-cache-abi"),
+            "TP size": self._hybrid_page_key(tp_rank=0, tp_size=2),
+            "TP rank": self._hybrid_page_key(tp_rank=1, tp_size=2),
+            "CP size": self._hybrid_page_key(attn_cp_rank=0, attn_cp_size=2),
+            "CP rank": self._hybrid_page_key(attn_cp_rank=1, attn_cp_size=2),
+            "layout": self._hybrid_page_key(page_first=False),
+            "logical page": self._hybrid_page_key(logical_page_size=4),
+            "pool page": self._hybrid_page_key(c4_page_size=4),
+            "component manifest": self._hybrid_page_key(c4_components=(8, 16)),
         }
         for field, key in incompatible.items():
             with self.subTest(field=field):
                 self.assertNotEqual(baseline, key)
 
-        self.assertIn(b"#v4/", baseline)
+        self.assertIn(b"#v5/", baseline)
 
     def test_dsv4_rank_replicas_share_the_tp0_component_keys(self):
-        tp0 = self._component_key(tp_rank=0, tp_size=4, is_mla_model=True)
-        tp3 = self._component_key(tp_rank=3, tp_size=4, is_mla_model=True)
+        tp0 = self._hybrid_page_key(tp_rank=0, tp_size=4, is_mla_model=True)
+        tp3 = self._hybrid_page_key(tp_rank=3, tp_size=4, is_mla_model=True)
 
         self.assertEqual(tp0, tp3)
 
@@ -902,9 +936,8 @@ class HybridPoolManifestTest(unittest.TestCase):
                 owner_addresses.add(
                     (
                         f"tcp://10.0.0.7:{store._control_port()}",
-                        store._segment_key(
+                        store._pool_page_key(
                             "0123456789abcdefdeadbeef",
-                            0,
                             PoolName.DEEPSEEK_V4_C4,
                         ),
                     )
@@ -915,8 +948,8 @@ class HybridPoolManifestTest(unittest.TestCase):
             hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
             target_address = (
                 hint.source_control_endpoint,
-                store._segment_key(
-                    "0123456789abcdefdeadbeef", 0, PoolName.DEEPSEEK_V4_C4
+                store._pool_page_key(
+                    "0123456789abcdefdeadbeef", PoolName.DEEPSEEK_V4_C4
                 ),
             )
             self.assertIn(target_address, owner_addresses)
@@ -972,7 +1005,7 @@ class HybridPoolManifestTest(unittest.TestCase):
         )
         self.anchor.get_page_buffer_meta.assert_not_called()
 
-    def test_finalizer_builds_size_classed_arenas_from_the_complete_manifest(self):
+    def test_finalizer_builds_named_pools_from_the_complete_manifest(self):
         store = _store(0, 1, local_dram_bytes=80)
         store.register_mem_pool_host(self.anchor)
         store.register_mem_host_pool_v2(self.anchor, PoolName.KV)
@@ -991,7 +1024,15 @@ class HybridPoolManifestTest(unittest.TestCase):
 
         constructor.assert_called_once()
         start_pump.assert_called_once()
+        config = constructor.call_args.args[0]
         backend = constructor.call_args.args[2]
+        self.assertEqual(
+            config.pool_layouts,
+            [
+                ("deepseek_v4_c128:24", 24),
+                ("deepseek_v4_c4:8", 8),
+            ],
+        )
         self.assertIsNone(backend.framework_dram)
         self.assertEqual(
             {
@@ -1003,20 +1044,20 @@ class HybridPoolManifestTest(unittest.TestCase):
                 for buffer in (*self.c4.buffers, *self.c128.buffers)
             },
         )
-        self.assertIsNone(backend.local_dram)
-        arenas = {
-            arena.length // arena.slot_count: arena
-            for arena in backend.local_dram_arenas
+        self.assertIsNotNone(backend.local_dram)
+        pools = {
+            name: (address, length)
+            for name, address, length in backend.local_dram.pools
         }
         self.assertEqual(
-            {size: (arena.slot_count, arena.length) for size, arena in arenas.items()},
-            {8: (4, 32), 24: (2, 48)},
+            {name: length for name, (_address, length) in pools.items()},
+            {"deepseek_v4_c128:24": 48, "deepseek_v4_c4:8": 32},
         )
         self.assertEqual(
-            {size: arena.address for size, arena in arenas.items()},
+            {name: address for name, (address, _length) in pools.items()},
             {
-                size: buffer.data_ptr()
-                for size, buffer in store._local_dram_buffers.items()
+                name: buffer.data_ptr()
+                for name, buffer in store._local_dram_buffers.items()
             },
         )
         self.assertEqual(
@@ -1026,6 +1067,37 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertIs(store._kvcr, constructor.return_value)
         self.assertEqual(self.c4.meta_calls, 1)
         self.assertEqual(self.c128.meta_calls, 1)
+
+    def test_equal_sizes_in_different_physical_pools_keep_separate_capacity(self):
+        store = _store(0, 1, local_dram_bytes=48)
+        c128_same_size = _ManifestPool(page_size=2, component_bytes=[8])
+        store.register_mem_pool_host(self.anchor)
+        store.register_mem_host_pool_v2(self.anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(self.c4, PoolName.DEEPSEEK_V4_C4)
+        store.register_mem_host_pool_v2(c128_same_size, PoolName.DEEPSEEK_V4_C128)
+
+        with (
+            mock.patch.object(kvcr_store, "_require_kvcr_api"),
+            mock.patch.object(kvcr_store, "_ephemeral_port", return_value=26000),
+            mock.patch.object(kvcr_store, "ZmqPeerControlChannel"),
+            mock.patch.object(kvcr_store, "KVCR") as constructor,
+            mock.patch.object(store, "_start_source_pump"),
+        ):
+            store.finalize_mem_pool_registration()
+
+        config = constructor.call_args.args[0]
+        backend = constructor.call_args.args[2]
+        self.assertEqual(
+            config.pool_layouts,
+            [
+                ("deepseek_v4_c128:8", 8),
+                ("deepseek_v4_c4:8", 8),
+            ],
+        )
+        self.assertEqual(
+            {name: length for name, _address, length in backend.local_dram.pools},
+            {"deepseek_v4_c128:8": 16, "deepseek_v4_c4:8": 32},
+        )
 
     def test_late_pool_registration_cannot_change_the_started_topology(self):
         self.store._kvcr = object()
@@ -1063,39 +1135,39 @@ class HybridPoolManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "physical pool indexer"):
             self.store._collect_pool_contexts()
 
-    def test_component_keys_are_pool_qualified_but_hints_still_cover_them(self):
+    def test_pool_page_keys_are_pool_qualified_but_hints_still_cover_them(self):
         self._collect()
         page = "0123456789abcdefdeadbeef"
 
-        c4_key = self.store._segment_key(page, 0, PoolName.DEEPSEEK_V4_C4)
-        c128_key = self.store._segment_key(page, 0, PoolName.DEEPSEEK_V4_C128)
-        kv_key = self.store._segment_key(page, 0)
+        c4_key = self.store._pool_page_key(page, PoolName.DEEPSEEK_V4_C4)
+        c128_key = self.store._pool_page_key(page, PoolName.DEEPSEEK_V4_C128)
+        kv_key = self.store._pool_page_key(page)
         hint = RouterHint(
             source_control_endpoint="tcp://127.0.0.1:25000",
             block_hashes=(page[:16],),
         )
 
         self.assertNotEqual(c4_key, c128_key)
-        self.assertEqual(kv_key, f"{page}#0".encode())
+        self.assertEqual(kv_key, f"{page}#v5/kv".encode())
         hinted_hashes = frozenset(hint.to_kvcr_hint()["block_hashes"])
         self.assertIn(self.store._key_adapter.decode(c4_key), hinted_hashes)
         self.assertIn(self.store._key_adapter.decode(c128_key), hinted_hashes)
 
     def test_descriptors_resolve_the_transfer_pool_and_its_geometry(self):
-        contexts = self._collect()
+        self._collect()
         # Ignore the one probe call made while constructing each context.
         c4_calls = self.c4.meta_calls
         c128_calls = self.c128.meta_calls
         indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
 
-        c4_descriptors, c4_pages = self.store._host_descriptors(
+        c4_descriptors, c4_page_keys = self.store._host_descriptors(
             PoolTransfer(
                 name=PoolName.DEEPSEEK_V4_C4,
                 keys=["p0", "p1"],
                 host_indices=indices,
             )
         )
-        c128_descriptors, c128_pages = self.store._host_descriptors(
+        c128_descriptors, c128_page_keys = self.store._host_descriptors(
             PoolTransfer(
                 name=PoolName.DEEPSEEK_V4_C128,
                 keys=["p0", "p1"],
@@ -1106,21 +1178,62 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertEqual(self.c4.meta_calls, c4_calls + 1)
         self.assertEqual(self.c128.meta_calls, c128_calls + 1)
         self.anchor.get_page_buffer_meta.assert_not_called()
-        self.assertEqual([len(page) for page in c4_pages], [2, 2])
-        self.assertEqual([len(page) for page in c128_pages], [1, 1])
-        self.assertEqual({desc.size for desc in c4_descriptors.values()}, {8})
-        self.assertEqual({desc.size for desc in c128_descriptors.values()}, {24})
-        self.assertTrue(
-            all(b"#v4/" in key and b"/deepseek_v4_c4/" in key for key in c4_descriptors)
+        self.assertEqual(c4_page_keys, list(c4_descriptors))
+        self.assertEqual(c128_page_keys, list(c128_descriptors))
+        self.assertEqual(
+            [len(page_descriptors) for page_descriptors in c4_descriptors.values()],
+            [2, 2],
+        )
+        self.assertEqual(
+            [len(page_descriptors) for page_descriptors in c128_descriptors.values()],
+            [1, 1],
+        )
+        self.assertEqual(
+            {
+                desc.size
+                for page_descriptors in c4_descriptors.values()
+                for desc in page_descriptors
+            },
+            {8},
+        )
+        self.assertEqual(
+            {
+                desc.size
+                for page_descriptors in c128_descriptors.values()
+                for desc in page_descriptors
+            },
+            {24},
+        )
+        self.assertEqual(
+            {
+                desc.info
+                for page_descriptors in c4_descriptors.values()
+                for desc in page_descriptors
+            },
+            {"deepseek_v4_c4:8"},
+        )
+        self.assertEqual(
+            {
+                desc.info
+                for page_descriptors in c128_descriptors.values()
+                for desc in page_descriptors
+            },
+            {"deepseek_v4_c128:24"},
         )
         self.assertTrue(
             all(
-                b"#v4/" in key and b"/deepseek_v4_c128/" in key
+                b"#v5/" in key and key.endswith(b"/deepseek_v4_c4")
+                for key in c4_descriptors
+            )
+        )
+        self.assertTrue(
+            all(
+                b"#v5/" in key and key.endswith(b"/deepseek_v4_c128")
                 for key in c128_descriptors
             )
         )
 
-    def test_local_hybrid_set_folds_component_results_per_page(self):
+    def test_local_hybrid_set_folds_atomic_results_per_pool_page(self):
         self._collect()
         submitted = []
 
@@ -1129,7 +1242,7 @@ class HybridPoolManifestTest(unittest.TestCase):
             return len(submitted)
 
         self.store._kvcr = SimpleNamespace(deposit=deposit)
-        failed_key = self.store._segment_key("p1", 1, PoolName.DEEPSEEK_V4_C4)
+        failed_key = self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C4)
 
         def submit_and_complete(submit):
             handle = submit()
@@ -1160,25 +1273,28 @@ class HybridPoolManifestTest(unittest.TestCase):
             },
         )
         self.assertEqual(len(submitted), 2)
-        self.assertEqual(len(submitted[0]), 4)
-        self.assertEqual({desc.size for desc in submitted[0].values()}, {8})
+        self.assertEqual(len(submitted[0]), 2)
+        self.assertEqual(
+            {desc.size for value in submitted[0].values() for desc in value}, {8}
+        )
+        self.assertEqual({len(value) for value in submitted[0].values()}, {2})
         self.assertEqual(len(submitted[1]), 2)
-        self.assertEqual({desc.size for desc in submitted[1].values()}, {24})
+        self.assertEqual(
+            {desc.size for value in submitted[1].values() for desc in value}, {24}
+        )
+        self.assertEqual({len(value) for value in submitted[1].values()}, {1})
 
     def test_hybrid_get_without_hint_fails_nonresident_components(self):
         self._collect()
         page_keys = ["aaaaaaaaaaaaaaaa-p0", "0123456789abcdef-p1"]
         resident = {
-            key: QueryStatus.HIT
-            for key in self.store._page_segment_keys(
+            self.store._pool_page_key(
                 page_keys[0], PoolName.DEEPSEEK_V4_C4
-            )
+            ): QueryStatus.HIT,
+            self.store._pool_page_key(
+                page_keys[1], PoolName.DEEPSEEK_V4_C4
+            ): QueryStatus.MISS,
         }
-        page1_keys = self.store._page_segment_keys(
-            page_keys[1], PoolName.DEEPSEEK_V4_C4
-        )
-        resident[page1_keys[0]] = QueryStatus.HIT
-        resident[page1_keys[1]] = QueryStatus.MISS
         submitted = []
 
         def query(keys):
@@ -1223,7 +1339,7 @@ class HybridPoolManifestTest(unittest.TestCase):
         core.submit_hint.assert_not_called()
         core.discard_hint.assert_not_called()
 
-    def test_local_hybrid_get_missing_component_completion_fails_the_page(self):
+    def test_local_hybrid_get_missing_page_completion_fails_the_page(self):
         self._collect()
         page_keys = ["p0", "p1"]
         submitted = []
@@ -1236,7 +1352,7 @@ class HybridPoolManifestTest(unittest.TestCase):
             query=lambda keys: [(QueryStatus.HIT, None)] * len(keys),
             deliver=deliver,
         )
-        missing = self.store._segment_key("p1", 1, PoolName.DEEPSEEK_V4_C4)
+        missing = self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C4)
 
         def submit_and_complete(submit):
             handle = submit()
@@ -1257,7 +1373,8 @@ class HybridPoolManifestTest(unittest.TestCase):
             result,
             {str(PoolName.DEEPSEEK_V4_C4): [True, False]},
         )
-        self.assertEqual(len(submitted[0][0]), 4)
+        self.assertEqual(len(submitted[0][0]), 2)
+        self.assertEqual({len(value) for value in submitted[0][0].values()}, {2})
         self.assertIsNone(submitted[0][1])
 
     def test_remote_hybrid_get_shares_one_hint_across_physical_pools(self):
@@ -1334,10 +1451,10 @@ class HybridPoolManifestTest(unittest.TestCase):
 
         def submit_and_complete(submit):
             handle = submit()
-            first_page = set(
-                self.store._page_segment_keys(page_keys[0], PoolName.DEEPSEEK_V4_C4)
+            first_page = self.store._pool_page_key(
+                page_keys[0], PoolName.DEEPSEEK_V4_C4
             )
-            return handle, {key: key in first_page for key in delivered}
+            return handle, {key: key == first_page for key in delivered}
 
         self.store._submit_and_wait = submit_and_complete
         with self.assertLogs(kvcr_store.logger, level="INFO") as captured:
@@ -1356,14 +1473,14 @@ class HybridPoolManifestTest(unittest.TestCase):
 
         self.assertFalse(self.store._locally_resident([b"component-0", b"component-1"]))
 
-    def test_local_hybrid_exists_folds_every_component_without_hint(self):
+    def test_local_hybrid_exists_folds_every_pool_page_without_hint(self):
         self._collect()
         page_keys = [
             "aaaaaaaaaaaaaaaa-p0",
             "0123456789abcdef-p1",
             "bbbbbbbbbbbbbbbb-p2",
         ]
-        missing = self.store._segment_key(page_keys[1], 1, PoolName.DEEPSEEK_V4_C4)
+        missing = self.store._pool_page_key(page_keys[1], PoolName.DEEPSEEK_V4_C4)
 
         def query(keys):
             return [
@@ -1420,9 +1537,9 @@ class HybridPoolManifestTest(unittest.TestCase):
         self._collect()
         page_keys = [f"p{i}" for i in range(5)]
         missing = {
-            self.store._segment_key("p3", 0, PoolName.DEEPSEEK_V4_C4),
-            self.store._segment_key("p1", 0, PoolName.DEEPSEEK_V4_C128),
-            self.store._segment_key("p3", 0, PoolName.DEEPSEEK_V4_C128),
+            self.store._pool_page_key("p3", PoolName.DEEPSEEK_V4_C4),
+            self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C128),
+            self.store._pool_page_key("p3", PoolName.DEEPSEEK_V4_C128),
         }
 
         self.store._kvcr = SimpleNamespace(
@@ -1461,7 +1578,7 @@ class HybridPoolManifestTest(unittest.TestCase):
     def test_local_hybrid_trailing_window_can_have_sparse_endpoints(self):
         self._collect()
         page_keys = [f"p{i}" for i in range(5)]
-        missing = self.store._segment_key("p2", 0, PoolName.DEEPSEEK_V4_C128)
+        missing = self.store._pool_page_key("p2", PoolName.DEEPSEEK_V4_C128)
         self.store._kvcr = SimpleNamespace(
             query=lambda keys: [
                 (QueryStatus.MISS if key == missing else QueryStatus.HIT, None)
@@ -1487,8 +1604,8 @@ class HybridPoolManifestTest(unittest.TestCase):
         self._collect()
         page_keys = ["p0", "p1"]
         missing = {
-            self.store._segment_key("p1", 0, PoolName.DEEPSEEK_V4_C4),
-            self.store._segment_key("p0", 0, PoolName.DEEPSEEK_V4_C128),
+            self.store._pool_page_key("p1", PoolName.DEEPSEEK_V4_C4),
+            self.store._pool_page_key("p0", PoolName.DEEPSEEK_V4_C128),
         }
         self.store._kvcr = SimpleNamespace(
             query=lambda keys: [
@@ -1558,12 +1675,12 @@ class HybridPoolManifestTest(unittest.TestCase):
 class UnaddressableParallelismTest(unittest.TestCase):
     """Rank coordinates a KVCR block key cannot encode must fail at startup.
 
-    A block key is ``sha256(token ids)#<segment>`` and a hint carries an endpoint
-    plus page hashes, so nothing on the wire says which model slice produced the
+    A block key names one physical-pool page and a hint carries an endpoint plus
+    page hashes, so nothing on the wire says which model slice produced the
     bytes; ``_rank_port_offset`` separates ``(dp, attn_cp, attn_tp)`` by port
-    instead. Pipeline rank and head splitting have no such separation -- same port
-    *and* same key, so the fetch lands another rank's bytes in pages the model
-    attends over.
+    instead. Pipeline rank and head splitting have no such separation -- same
+    port and same key, so the fetch lands another rank's bytes in pages the
+    model attends over.
     """
 
     def _config(self, **overrides) -> HiCacheStorageConfig:
@@ -1678,8 +1795,8 @@ class RemoteFailureTest(unittest.TestCase):
         self.store._config = SimpleNamespace(get_timeout_s=0.05)
         page = bytearray(b"before")
         self.store._host_descriptors = lambda transfer: (
-            {"seg-a": page},
-            [["seg-a"]],
+            {"page-a": [page]},
+            ["page-a"],
         )
         result = {}
 
@@ -1703,8 +1820,8 @@ class RemoteFailureTest(unittest.TestCase):
 
         # Model a DMA that lands after the wall-clock budget, then its terminal
         # completion. HiCache must not be able to reuse the page between them.
-        core.last_destinations["seg-a"][:] = b"late!!"
-        core.finish(core.last_handle, ["seg-a"])
+        core.last_destinations["page-a"][0][:] = b"late!!"
+        core.finish(core.last_handle, ["page-a"])
         thread.join(timeout=1.0)
 
         self.assertFalse(thread.is_alive())
@@ -1719,8 +1836,8 @@ class RemoteFailureTest(unittest.TestCase):
         self.store._config = SimpleNamespace(get_timeout_s=0.05)
         page = bytearray(b"before")
         self.store._host_descriptors = lambda transfer: (
-            {"seg-a": page},
-            [["seg-a"]],
+            {"page-a": [page]},
+            ["page-a"],
         )
         result = {}
 
@@ -1737,8 +1854,8 @@ class RemoteFailureTest(unittest.TestCase):
         self.assertTrue(thread.is_alive())
         self.assertIn(core.last_handle, self.store._waiting_ops)
 
-        core.last_destinations["seg-a"][:] = b"late!!"
-        core.finish(core.last_handle, ["seg-a"])
+        core.last_destinations["page-a"][0][:] = b"late!!"
+        core.finish(core.last_handle, ["page-a"])
         core.poll_recovered.set()
         thread.join(timeout=1.0)
 
@@ -1750,7 +1867,7 @@ class RemoteFailureTest(unittest.TestCase):
         for the prefix reported here, released only after a full deliver round trip.
         """
         self.store._kvcr = FakeKVCR()
-        self.store._locally_resident = lambda segment_keys: False
+        self.store._locally_resident = lambda block_keys: False
         extra_info = _hint_extra_info("tcp://10.0.0.7:25000")
 
         result = self.store.batch_exists_v2(
@@ -1781,8 +1898,8 @@ class RaisingCoreTest(unittest.TestCase):
         self.store._slot_size = 16
         self.store._kvcr = _ExplodingKVCR()
         self.store._host_descriptors = lambda transfer: (
-            {"seg-a": object()},
-            [["seg-a"]],
+            {"page-a": [object()]},
+            ["page-a"],
         )
 
     def _transfer(self, keys: List[str]) -> SimpleNamespace:
