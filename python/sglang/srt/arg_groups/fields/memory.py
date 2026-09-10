@@ -152,6 +152,7 @@ class Memory:
                 "simm",
                 "mori",
                 "shm",
+                "kvcr",
             ],
         ),
     ] = None

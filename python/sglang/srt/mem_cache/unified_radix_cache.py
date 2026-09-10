@@ -13,6 +13,7 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -1787,6 +1788,7 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1895,6 +1897,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            kv_hints=kv_hints,
             extra_pools=aux_xfers or None,
         )
         stats["issued"] += 1

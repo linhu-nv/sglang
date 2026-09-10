@@ -24,6 +24,10 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    _kv_hints_extra_info,
+)
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -51,8 +55,16 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            kv_hints=kv_hints,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -65,6 +77,7 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ):
         self.request_id = request_id
         self._lock = threading.Lock()
@@ -77,6 +90,7 @@ class PrefetchOperation(StorageOperation):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
+            kv_hints=kv_hints,
         )
         self.pool_transfers_done = not bool(pool_transfers)
 
@@ -546,6 +560,7 @@ class HybridCacheController(BaseHiCacheController):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
@@ -553,6 +568,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            kv_hints=kv_hints,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -582,7 +598,8 @@ class HybridCacheController(BaseHiCacheController):
         operation.all_hash_values = hash_value
 
         extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
+            extra_info=_kv_hints_extra_info(operation),
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
