@@ -474,6 +474,13 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Restore FlexKV's host tier asynchronously on a PD decode server: launch the
+    # RETRIEVE on one scheduler tick and poll it on later ticks, instead of
+    # blocking the scheduler thread inside FlexKV's launch+wait. Off by default —
+    # FlexKV writes the KV from another process over CUDA IPC, so the restored
+    # slots stay private to the request until the load is confirmed (see
+    # FlexKVRadixCache._async_restores).
+    SGLANG_FLEXKV_ENABLE_ASYNC_DECODE_RESTORE = EnvBool(False)
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)

@@ -6765,6 +6765,17 @@ class ServerArgs:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
                 )
+            if self.enable_flexkv:
+                # Two independent decode-offload mechanisms. FlexKV offloads
+                # through the tree cache at request finish and keeps owning the
+                # slots until then; DecodeKVCacheOffloadManager stages through
+                # its own host pool and frees slots itself. Running both would
+                # double-manage slot lifetime.
+                raise ValueError(
+                    "--disaggregation-decode-enable-offload-kvcache is mutually "
+                    "exclusive with --enable-flexkv. FlexKV offloads decode KV "
+                    "via --disaggregation-decode-enable-radix-cache."
+                )
 
         # Validate the effective ratio: model branches may declare a reset
         # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes

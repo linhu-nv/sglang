@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
+    DecodeRestoreDriver,
     EvictParams,
     EvictResult,
     IncLockRefResult,
@@ -488,6 +489,20 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 if tracked is not None:
                     node, dec_params = tracked
                     self._inner_cache.dec_lock_ref(node, dec_params)
+
+    def has_inflight_io(self) -> bool:
+        with self._node_lock:
+            return bool(self._inflight_store_nodes)
+
+    @property
+    def decode_restore_driver(self) -> DecodeRestoreDriver:
+        # Only the layerwise path defers the copy past init_load_back, and it
+        # waits per-layer during the forward rather than reporting completions,
+        # so there is nothing for the restore state machine to poll. The MP path
+        # blocks in retrieve_kv.
+        if self.flexkv_connector.enable_layerwise:
+            return DecodeRestoreDriver.MERGED_EVENT
+        return DecodeRestoreDriver.BLOCKING
 
     def release_aborted_request(self, rid: str) -> None:
         self._load_markers.pop(rid, None)

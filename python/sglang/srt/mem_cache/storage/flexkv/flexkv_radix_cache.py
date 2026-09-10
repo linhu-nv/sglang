@@ -36,12 +36,15 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecodeRestoreDriver,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
+    RestoreCompletion,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from flexkv.integration.sglang.connector import (
@@ -61,6 +64,50 @@ logger = logging.getLogger(__name__)
 class FlexKVMode(enum.Enum):
     MP = enum.auto()  # synchronous lookup → retrieve in two phases
     IP = enum.auto()  # in-process layerwise transfer
+
+
+def _assert_mode_supports_disaggregation(
+    mode: FlexKVMode, server_args: ServerArgs
+) -> None:
+    """IP mode drains its per-layer eventfds from inside the model forward.
+
+    On a PD decode server the restore has to finish *before* the request joins a
+    batch — decode already promised prefill that prefix via ``decode_prefix_len``
+    — so there is no forward left to drain them, and the waits would land on the
+    wrong request's layers.
+    """
+    if mode is FlexKVMode.IP and server_args.disaggregation_mode == "decode":
+        raise ValueError(
+            "FLEXKV_ENABLE_LAYERWISE_TRANSFER=1 is not supported on a PD decode "
+            "server: the layerwise restore has no forward pass to wait on. Unset "
+            "it to use FlexKV MP mode."
+        )
+
+
+@dataclass
+class _AsyncRestore:
+    """One in-flight async RETRIEVE, holding everything needed to insert the
+    node once the load lands.
+
+    The node is deliberately *not* in the tree while the load is in flight:
+    FlexKV writes these slots from another process over CUDA IPC, so there is
+    no stream ordering that would make a concurrent reader safe — a node
+    reachable by ``match_prefix`` could hand another request KV that has not
+    been written yet. Insertion is deferred to completion, which also keeps
+    slot ownership identical to the synchronous path (the tree owns the slots,
+    and the request's ``cache_protected_len`` covers them).
+    """
+
+    req: Req
+    key: RadixKey
+    value_numel: int
+    slots: torch.Tensor
+    last_node: TreeNode
+
+    @property
+    def node_key(self) -> RadixKey:
+        """The key the loaded node occupies under ``last_node``."""
+        return self.key[self.value_numel : self.value_numel + int(self.slots.numel())]
 
 
 @dataclass
@@ -117,6 +164,7 @@ class FlexKVRadixCache(RadixCache):
         self._mode = (
             FlexKVMode.IP if self.flexkv_connector.enable_layerwise else FlexKVMode.MP
         )
+        _assert_mode_supports_disaggregation(self._mode, server_args)
         if self._mode is FlexKVMode.IP:
             # Register the eventfd counter onto sglang's KV pool so each
             # forward layer blocks on its own eventfd.
@@ -138,6 +186,16 @@ class FlexKVRadixCache(RadixCache):
         self._inflight_store_nodes: dict[str, TreeNode] = {}
         self._node_lock = threading.Lock()
 
+        # Async decode restore: opt-in, MP only, and only meaningful on a PD
+        # decode server (that is the only place ``init_load_back`` runs on the
+        # scheduler thread ahead of admission).
+        self._async_restore_enabled = (
+            self._mode is FlexKVMode.MP
+            and server_args.disaggregation_mode == "decode"
+            and envs.SGLANG_FLEXKV_ENABLE_ASYNC_DECODE_RESTORE.get()
+        )
+        self._async_restores: dict[str, _AsyncRestore] = {}
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -146,6 +204,10 @@ class FlexKVRadixCache(RadixCache):
         super().reset()
         if hasattr(self, "_load_markers"):
             self._load_markers.clear()
+        if hasattr(self, "_async_restores"):
+            # ``flexkv_connector.reset`` below drains the launches; the slots
+            # themselves belong to the pool that ``super().reset()`` just wiped.
+            self._async_restores.clear()
         if hasattr(self, "_inflight_store_nodes"):
             with self._node_lock:
                 self._inflight_store_nodes.clear()
@@ -204,6 +266,14 @@ class FlexKVRadixCache(RadixCache):
     ) -> MatchResult:
         """LOOKUP-only path. Sets ``host_hit_length`` on the result so
         the scheduler later invokes :meth:`init_load_back`."""
+        if req.rid in self._load_markers:
+            # A previous lookup for this rid never reached ``init_load_back``,
+            # so FlexKV is still holding its task. The PD decode path matches
+            # twice on purpose (once to size admission, once to restore); left
+            # alone, the first task would be overwritten here and leak.
+            self._load_markers.pop(req.rid, None)
+            self.flexkv_connector.release_pending(req.rid)
+
         token_ids = key.raw_token_ids()
         device_len = int(device_value.numel())
         if device_len >= len(token_ids):
@@ -310,6 +380,14 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
 
+        if self._async_restore_enabled:
+            return self._start_async_load_back(
+                req=req,
+                marker=marker,
+                uncached_len=params.host_hit_length,
+                last_node=last_node,
+            )
+
         result = self._allocate_and_load(
             key=marker.key,
             value_numel=marker.value_numel,
@@ -330,6 +408,159 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
         return result
+
+    # ------------------------------------------------------------------
+    # Async MP RETRIEVE (PD decode)
+    # ------------------------------------------------------------------
+
+    def _start_async_load_back(
+        self,
+        *,
+        req: Req,
+        marker: _LoadBackMarker,
+        uncached_len: int,
+        last_node: TreeNode,
+    ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
+        """Allocate the destination slots and launch the RETRIEVE without waiting.
+
+        Unlike the synchronous path this does *not* insert a ``TreeNode`` yet:
+        the slots hold no valid KV until FlexKV signals completion, and a node
+        in the tree is reachable by ``match_prefix`` from any other request.
+        The caller gets the slots and the unchanged ``last_node``;
+        :meth:`poll_completed_restores` inserts the node once the KV is
+        readable, which is what makes the tree — not the request — the owner of
+        these slots, matching what ``cache_protected_len`` already assumes.
+        """
+        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+        if uncached_len <= 0:
+            self.flexkv_connector.release_pending(req.rid)
+            return empty, last_node
+
+        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
+            self.evict(EvictParams(num_tokens=uncached_len))
+        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        if token_slots is None:
+            self.flexkv_connector.release_pending(req.rid)
+            return empty, last_node
+
+        slots = token_slots.to(torch.int64)
+        try:
+            launched = self.flexkv_connector.start_retrieve_kv(req.rid, slots)
+        except Exception:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            self.flexkv_connector.release_pending(req.rid)
+            raise
+        if launched <= 0:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            self.flexkv_connector.release_pending(req.rid)
+            return empty, last_node
+
+        # A short launch would leave a hole in the middle of the prefix, which
+        # the restore contract cannot express — the decode side already told
+        # prefill the whole prefix was covered. Fail the restore instead.
+        if launched < uncached_len:
+            logger.warning(
+                "FlexKV async retrieve for rid=%s launched %d of %d slots; "
+                "failing the restore rather than admitting a partial prefix",
+                req.rid,
+                launched,
+                uncached_len,
+            )
+            self.flexkv_connector.wait_load(req.rid)
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return empty, last_node
+
+        self._async_restores[req.rid] = _AsyncRestore(
+            req=req,
+            key=marker.key,
+            value_numel=marker.value_numel,
+            slots=token_slots,
+            last_node=last_node,
+        )
+        return token_slots, last_node
+
+    def poll_completed_restores(  # type: ignore[override]
+        self,
+    ) -> dict[str, RestoreCompletion]:
+        """Report async restores that finished, settling their slots.
+
+        A success inserts the node the launch deferred; a failure frees the
+        slots, which nothing else can reach.
+        """
+        if not self._async_restores:
+            return {}
+        results: dict[str, RestoreCompletion] = {}
+        for rid, ok in self.flexkv_connector.check_completed_loads().items():
+            restore = self._async_restores.pop(rid, None)
+            if restore is None:
+                continue
+            if not ok:
+                self._free_restored_slots(restore)
+                results[rid] = RestoreCompletion(succeeded=False)
+                continue
+            results[rid] = RestoreCompletion(
+                succeeded=True, node=self._insert_restored_node(restore)
+            )
+        return results
+
+    def abort_restore(self, rid: str) -> None:  # type: ignore[override]
+        """Settle an in-flight restore for a request that is going away.
+
+        Draining first is mandatory: FlexKV is mid-flight writing these slots
+        from another process, and there is no way to prove a cancelled task
+        never started its copy. Only then are they safe to free.
+        """
+        restore = self._async_restores.pop(rid, None)
+        if restore is None:
+            return
+        self.flexkv_connector.wait_load(rid)
+        self._free_restored_slots(restore)
+
+    def _insert_restored_node(self, restore: _AsyncRestore) -> Optional[TreeNode]:
+        """Hand a completed restore's slots to the tree, returning the new node.
+
+        Ownership has to land where the synchronous path leaves it: the
+        request's ``cache_protected_len`` already covers these slots, so its
+        release path will *not* free them and the tree must own them. The lock
+        the launch took sits on ``last_node``, so it moves down to the new node
+        — otherwise the node holding the request's own prefix would be
+        evictable while the request is still waiting to run.
+
+        Returns ``None`` when the tree won't take the slots. The launch left
+        ``last_node`` free to grow, so another request may have inserted the
+        very branch this node would occupy; overwriting it would orphan the
+        slots already there. The KV in hand is still valid, so the restore
+        stays a success and the request keeps the slots privately instead —
+        pulling ``cache_protected_len`` back below them is what makes its own
+        release path free them.
+        """
+        last_node = restore.last_node
+        child_key = restore.node_key.child_key(self.page_size)
+        if last_node.children.get(child_key) is not None:
+            req = restore.req
+            req.cache_protected_len = min(req.cache_protected_len, restore.value_numel)
+            return None
+        new_node = self._insert_loaded_node(
+            key=restore.key,
+            value_numel=restore.value_numel,
+            slots=restore.slots,
+            last_node=last_node,
+        )
+        # Raise before lowering so the path to the root never momentarily drops
+        # to an evictable lock_ref.
+        self.inc_lock_ref(new_node)
+        self.dec_lock_ref(last_node)
+        return new_node
+
+    def _free_restored_slots(self, restore: _AsyncRestore) -> None:
+        """Free a restore's slots directly.
+
+        They are unreachable by anyone else — never inserted into the tree, and
+        never written into ``req_to_token`` (that happens at commit, which a
+        settled-as-failed restore never reaches), so the request's own release
+        path would not find them.
+        """
+        self.token_to_kv_pool_allocator.free(restore.slots)
 
     def _allocate_and_load(
         self,
@@ -375,21 +606,37 @@ class FlexKVRadixCache(RadixCache):
         else:
             fetched_slots = token_slots
 
+        new_node = self._insert_loaded_node(
+            key=key,
+            value_numel=value_numel,
+            slots=fetched_slots,
+            last_node=last_node,
+        )
+        return fetched_slots, new_node
+
+    def _insert_loaded_node(
+        self,
+        *,
+        key: RadixKey,
+        value_numel: int,
+        slots: torch.Tensor,
+        last_node: TreeNode,
+    ) -> TreeNode:
+        """Attach freshly-loaded device slots to the tree as a child of
+        ``last_node``. Only call once the KV in ``slots`` is actually readable."""
+        num_loaded = int(slots.numel())
         new_node = TreeNode(priority=last_node.priority)
-        start = value_numel
-        end = start + num_retrieved
-        new_node.key = key[start:end]
-        new_node.value = fetched_slots
+        new_node.key = key[value_numel : value_numel + num_loaded]
+        new_node.value = slots
         new_node.parent = last_node
         last_node.children[new_node.key.child_key(self.page_size)] = new_node
-        self.evictable_size_ += num_retrieved
+        self.evictable_size_ += num_loaded
         self._update_leaf_status(last_node)
         self._update_leaf_status(new_node)
 
         self._record_store_event(new_node.parent)
         self._record_store_event(new_node)
-
-        return fetched_slots, new_node
+        return new_node
 
     # ------------------------------------------------------------------
     # cache_finished_req (STORE)
@@ -495,9 +742,29 @@ class FlexKVRadixCache(RadixCache):
     # Optional pass-throughs used by the scheduler
     # ------------------------------------------------------------------
 
+    @property
+    def decode_restore_driver(self) -> DecodeRestoreDriver:  # type: ignore[override]
+        # Synchronous MP ``init_load_back`` is launch + wait, so the KV is on
+        # device by the time it returns. IP mode is asynchronous, but it is
+        # rejected on a decode server (see
+        # ``_assert_mode_supports_disaggregation``).
+        if self._async_restore_enabled:
+            return DecodeRestoreDriver.PER_REQUEST_POLL
+        return DecodeRestoreDriver.BLOCKING
+
+    def has_inflight_io(self) -> bool:
+        """True while a store or async restore is still in flight, so the
+        scheduler can hold off destructive idle-time work (flush_cache /
+        memory release)."""
+        if self._async_restores:
+            return True
+        with self._node_lock:
+            return bool(self._inflight_store_nodes)
+
     def release_aborted_request(self, rid: str) -> None:
         """Clean up tracking for an aborted request without invoking FlexKV."""
         self._load_markers.pop(rid, None)
+        self.abort_restore(rid)
         with self._node_lock:
             node = self._inflight_store_nodes.pop(rid, None)
         if node is not None:

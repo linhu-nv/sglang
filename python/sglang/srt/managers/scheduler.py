@@ -358,9 +358,14 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
 
         self.enable_flexkv = bool(server_args.enable_flexkv)
+        # "decode hicache" means the decode-side tree cache owns a host tier it
+        # can restore from, so the PD restore state machine has to run: decode
+        # promises prefill a `decode_prefix_len` that includes host-tier tokens,
+        # and something must pull those back to device before the request is
+        # admitted. Both HiCache and FlexKV provide that tier.
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
-            and self.enable_hierarchical_cache
+            and (self.enable_hierarchical_cache or self.enable_flexkv)
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
@@ -3780,6 +3785,10 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
+
+            # FlexKV stores are async and still reference GPU source slots.
+            if self.enable_flexkv:
+                idle &= not self.tree_cache.has_inflight_io()
 
         return idle
 

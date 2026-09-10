@@ -11,7 +11,10 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecodeRestoreDriver,
+    InitLoadBackParams,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -70,7 +73,12 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.enable_decode_hicache:
+        # Only HiCache splits its host tier into L2 (host pool) + L3 (storage
+        # backend) and needs the extra query. FlexKV reports everything it can
+        # serve through ``host_hit_length`` and has no storage-hit query.
+        if self.scheduler.enable_decode_hicache and (
+            self.scheduler.enable_hierarchical_cache
+        ):
             last_host_node = result.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 matched_len = l1_prefix_len + l2_host_hit_length
@@ -169,10 +177,18 @@ class DecodeHiCacheTransferMixin:
     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""
 
     def _clean_hicache_prefetch_resources(self, decode_req: DecodeRequest) -> None:
-        if (
+        # A FlexKV backend holds no prefetch, but it may hold a lookup task from
+        # a match that never reached init_load_back, or an in-flight async load;
+        # release_aborted_request is how it gives both back. Only the layerwise
+        # path (MERGED_EVENT-like, self-popping) has nothing to hand over.
+        holds_backend_state = (
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
-        ):
+        ) or (
+            self.tree_cache.decode_restore_driver
+            is not DecodeRestoreDriver.MERGED_EVENT
+        )
+        if holds_backend_state:
             self.tree_cache.release_aborted_request(decode_req.req.rid)
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
@@ -238,11 +254,27 @@ class DecodeHiCacheTransferMixin:
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
-        if not hasattr(self.tree_cache, "is_load_back_event_done"):
-            return
+        driver = self.tree_cache.decode_restore_driver
+        # Poll before collecting: a request that completes on this tick should
+        # reach READY now rather than waiting a full tick for the next pass.
+        if driver is DecodeRestoreDriver.PER_REQUEST_POLL:
+            self._reap_polled_restores(decode_reqs)
 
-        # Filter once: keep only PENDING reqs that still need restore work;
-        # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
+        active = self._collect_active_restores(decode_reqs)
+        if not active:
+            return
+        if driver is DecodeRestoreDriver.MERGED_EVENT:
+            self._advance_merged_event_restores(active)
+        elif driver is DecodeRestoreDriver.PER_REQUEST_POLL:
+            self._advance_polled_restores(active)
+        else:
+            self._advance_blocking_restores(active)
+
+    def _collect_active_restores(
+        self, decode_reqs: List[DecodeRequest]
+    ) -> List[DecodeRequest]:
+        """Keep only PENDING reqs that still need restore work; trivially-done
+        reqs (no prefix_match / nothing to restore) flip to READY."""
         active: List[DecodeRequest] = []
         for dr in decode_reqs:
             if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
@@ -252,6 +284,65 @@ class DecodeHiCacheTransferMixin:
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
                 continue
             active.append(dr)
+        return active
+
+    def _advance_blocking_restores(self, active: List[DecodeRequest]) -> None:
+        """Driver for backends whose ``init_load_back`` blocks until the KV is on
+        device (FlexKV MP mode). No event polling — the load is done when the
+        call returns.
+
+        The blocking happens on the scheduler thread, so restore at most one
+        request per tick: a queue of admitted requests would otherwise chain
+        their host->device copies into a single stall that also holds up the
+        running decode batch.
+        """
+        dr = active[0]
+        if self._try_hicache_queue_load_back(dr):
+            dr.hicache_restore_status = HiCacheRestoreResult.READY
+
+    def _reap_polled_restores(self, decode_reqs: List[DecodeRequest]) -> None:
+        """Apply out-of-band restore completions to their requests.
+
+        The backend reports each rid exactly once, so a rid whose request has
+        already left the queue must not be looked up again — it was settled by
+        ``_clean_hicache_prefetch_resources`` on the way out.
+        """
+        completed = self.tree_cache.poll_completed_restores()
+        if not completed:
+            return
+        by_rid = {dr.req.rid: dr for dr in decode_reqs}
+        for rid, result in completed.items():
+            dr = by_rid.get(rid)
+            if dr is None or dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
+                continue
+            if result.node is not None:
+                # The backend deferred insertion until the KV landed and moved
+                # the lock ref onto the new node; follow it, or commit/abort
+                # would unlock a node that no longer covers this prefix.
+                dr.hicache_restored_node = result.node
+            dr.hicache_restore_status = (
+                HiCacheRestoreResult.READY
+                if result.succeeded
+                else HiCacheRestoreResult.FAILED
+            )
+
+    def _advance_polled_restores(self, active: List[DecodeRequest]) -> None:
+        """Driver for backends that start a per-request transfer and report
+        completion out of band (FlexKV async MP).
+
+        There is no shared event slot and no merged kick, so every request that
+        has not launched yet launches now; completions arrive via
+        ``_reap_polled_restores`` on a later tick.
+        """
+        for dr in active:
+            if dr.hicache_restored_node is not None:
+                # Already launched; waiting on the backend's completion report.
+                continue
+            self._try_hicache_queue_load_back(dr)
+
+    def _advance_merged_event_restores(self, active: List[DecodeRequest]) -> None:
+        if not hasattr(self.tree_cache, "is_load_back_event_done"):
+            return
 
         # Phase A: advance in-flight DMAs to READY.
         for dr in active:

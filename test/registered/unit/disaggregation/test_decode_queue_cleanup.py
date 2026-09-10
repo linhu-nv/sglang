@@ -208,6 +208,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_flexkv = False
 
         self.assertFalse(scheduler.is_fully_idle())
 

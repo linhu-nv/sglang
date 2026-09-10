@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -150,6 +151,44 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+
+
+class DecodeRestoreDriver(enum.Enum):
+    """How the PD decode restore state machine drives one backend's load_back.
+
+    Decode promises prefill a ``decode_prefix_len`` that includes host-tier
+    tokens, so those tokens must be back on device before the request is
+    admitted. Backends differ in how completion is observed:
+
+    * ``BLOCKING`` — ``init_load_back`` returns only once the KV is on device
+      (FlexKV MP mode). Nothing to poll; flip straight to READY.
+    * ``MERGED_EVENT`` — ``init_load_back`` queues a DMA onto a shared stream
+      and completion is observed through ``is_load_back_event_done`` after a
+      single merged kick (HiCache). Requests batch behind one event slot.
+    * ``PER_REQUEST_POLL`` — ``init_load_back`` starts a per-request transfer
+      that completes out of band, and ``poll_completed_restores`` names the
+      requests that finished (FlexKV async MP). No merged kick, no shared slot.
+    """
+
+    BLOCKING = "blocking"
+    MERGED_EVENT = "merged_event"
+    PER_REQUEST_POLL = "per_request_poll"
+
+
+class RestoreCompletion(NamedTuple):
+    """Outcome of one ``PER_REQUEST_POLL`` restore.
+
+    Attributes:
+        succeeded :   Whether the KV actually landed on device.
+        node      :   On success, the node now covering the restored prefix, if
+                      the backend deferred insertion until completion. The
+                      caller must retarget the request's restored-node handle at
+                      it, because that is where the backend moved the lock ref.
+                      ``None`` means keep the handle the launch returned.
+    """
+
+    succeeded: bool
+    node: Optional[Any] = None
 
 
 class MatchResult(NamedTuple):
@@ -307,6 +346,33 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
+
+    def has_inflight_io(self) -> bool:
+        """Whether async host-tier IO still references pool slots.
+
+        The scheduler consults this before destructive idle-time work.
+        """
+        return False
+
+    @property
+    def decode_restore_driver(self) -> DecodeRestoreDriver:
+        """Which driver the PD decode restore state machine should run.
+
+        See :class:`DecodeRestoreDriver`. Defaults to the HiCache driver
+        because HiCache is the only in-tree backend with a host tier.
+        """
+        return DecodeRestoreDriver.MERGED_EVENT
+
+    def poll_completed_restores(self) -> dict[str, RestoreCompletion]:
+        """For ``PER_REQUEST_POLL`` backends: the restores that completed since
+        the last call. Each rid is reported exactly once.
+        """
+        return {}
+
+    def abort_restore(self, rid: str) -> None:
+        """For ``PER_REQUEST_POLL`` backends: settle an in-flight restore whose
+        request is going away, so its destination slots are safe to free."""
+        pass
 
     def flush_write_through_acks(self) -> None:
         """Release lock_ref on radix-tree nodes whose write-through has completed.
