@@ -62,6 +62,11 @@ _needs_kvcr = unittest.skipUnless(_HAS_KVCR, "nvidia-kvcr wheel not installed")
 
 _BASE_CONTROL_PORT = 25000
 
+# Sentinel for "the helper's default", so a test can ask for no buffers at all.
+_UNSET = object()
+# Fabricated host address for the fake pools; nothing dereferences it.
+_FAKE_BASE_PTR = 1 << 20
+
 
 def _storage_config(
     tp_rank: int,
@@ -126,6 +131,34 @@ def _store(
     )
 
 
+def _fake_pool(
+    sizes: List[int],
+    page_size: int = 64,
+    buffers: object = _UNSET,
+) -> SimpleNamespace:
+    """A host pool shaped like the two accessors this backend reads.
+
+    ``sizes`` is one page's component byte sizes, as ``get_page_buffer_meta``
+    reports them; the pointers it returns are fabricated and only ever compared
+    for count. ``buffers`` defaults to one registrable tensor.
+    """
+
+    def page_buffer_meta(indices):
+        pages = max(1, len(indices) // page_size)
+        return (
+            [_FAKE_BASE_PTR + i for i in range(pages * len(sizes))],
+            list(sizes) * pages,
+        )
+
+    return SimpleNamespace(
+        page_size=page_size,
+        get_page_buffer_meta=page_buffer_meta,
+        get_hybrid_pool_buffer=lambda: (
+            [torch.empty(64, dtype=torch.uint8)] if buffers is _UNSET else buffers
+        ),
+    )
+
+
 def _hint_extra_info(endpoint: str) -> HiCacheStorageExtraInfo:
     """One kv.fetch hint, in the envelope the request path carries."""
     return HiCacheStorageExtraInfo(
@@ -186,6 +219,11 @@ class FakeKVCR:
         self.next_handle = 100
 
     def deliver(self, destinations, request_id=None) -> int:
+        with self._lock:
+            self.next_handle += 1
+            return self.next_handle
+
+    def deposit(self, descriptors) -> int:
         with self._lock:
             self.next_handle += 1
             return self.next_handle
@@ -293,28 +331,24 @@ class UnusableHostPoolTest(unittest.TestCase):
     """Host pool layouts the backend cannot run against must fail at startup."""
 
     def test_an_unusable_pool_refuses_to_start_the_backend(self):
-        """``framework_dram`` is the one registration both directions address --
-        even the local-tier copy is a NIXL loopback -- and the local DRAM tier is
-        the backend's only storage. Warning and starting anyway lets a
+        """Both directions address host pages by NIXL descriptor, into a local
+        DRAM tier sized from the page layout. Warning and starting anyway lets a
         DeepSeek-V4-style per-layer pool name unregistered memory in every
         transfer, or reads downstream as a cold server while every peer serve
         silently has nothing to offer.
+
+        Registration is where this has to fail, not the build: the core is built
+        lazily on first use, long after the launch would have succeeded.
         """
         pools = {
-            # Probe-able, so the local tier sizes fine, but kv_buffer is a
-            # per-layer list: the layout with no single contiguous region.
-            "kv_buffer": SimpleNamespace(
-                page_size=64,
-                kv_buffer=[object(), object()],
-                get_page_buffer_meta=lambda indices: ([1024, 2048], [16, 16]),
+            # Probe-able, so the local tier sizes fine, but the pool exposes no
+            # tensor: nothing to register with NIXL.
+            "register with NIXL": _fake_pool(
+                sizes=[16, 16], buffers=[object(), object()]
             ),
-            # Registrable kv_buffer, so this gets past the framework_dram gate
-            # and fails on the probe alone.
-            "local DRAM tier": SimpleNamespace(
-                page_size=64,
-                kv_buffer=torch.empty(64, dtype=torch.uint8),
-                get_page_buffer_meta=lambda indices: ([], []),
-            ),
+            # Registrable buffer, so this gets past the NIXL gate and fails on
+            # the page-layout probe alone.
+            "positive number of bytes": _fake_pool(sizes=[], buffers=None),
         }
 
         for expected, pool in pools.items():
@@ -327,76 +361,175 @@ class UnusableHostPoolTest(unittest.TestCase):
 
 @_needs_kvcr
 class SidecarPoolTest(unittest.TestCase):
-    """A pool this backend cannot address must never be reported as served.
+    """A hybrid stack's sidecar pools must be addressed as their own storage.
 
     A hybrid KV stack (DSA/MiniMax indexer, Mamba, SWA) sends one ``PoolTransfer``
-    per pool, the sidecar one derived from the KV pool's indices and hashes. This
-    backend resolves addresses through ``mem_pool_host``, which forwards to the
-    anchor pool -- so a sidecar transfer moves KV bytes into KV pages, reports
-    success, and leaves the sidecar untouched. ``True`` for a page never written
-    makes ``_sync_and_clamp_prefetch_result`` skip the clamp and the model attends
-    over an indexer page holding KV bytes. Every entry point -- registration, get,
-    set, exists -- must score the pool a miss on its own.
+    per pool, the sidecar one derived from the KV pool's indices and *hashes*.
+    Two things follow, and both are silent-wrong-output if missed: the addresses
+    must come from the sidecar's own host pool (resolving through the anchor
+    would move KV bytes into KV pages, report success, and leave the sidecar
+    untouched), and the block keys must carry the pool (sharing the KV page hash
+    would make the second pool's deposit overwrite the first's blocks).
+
+    A pool that never registered at all is still scored a miss, since nothing
+    was written for it.
     """
 
-    def _store_with_core(self) -> KVCRStore:
+    def _store_with_pools(self) -> KVCRStore:
+        """A store with a KV pool and an indexer sidecar, and a fake core."""
         store = _store(0, 1)
+        store.register_mem_pool_host(_fake_pool(sizes=[16, 16]))
+        store.register_mem_host_pool_v2(_fake_pool(sizes=[8]), PoolName.INDEXER)
         store._kvcr = FakeKVCR()
-        store._segments_per_page = 1
         return store
 
-    def _transfers(self):
-        """One KV transfer and one sidecar transfer, as a hybrid stack sends."""
+    def _transfers(self, names=(PoolName.KV, PoolName.INDEXER)):
+        """One transfer per pool, all carrying the KV page hashes."""
         return [
-            PoolTransfer(name=PoolName.KV, keys=["p0", "p1"]),
             PoolTransfer(
-                name=PoolName.INDEXER,
+                name=name,
                 keys=["p0", "p1"],
-                indices_from_pool=PoolName.KV,
-            ),
+                host_indices=torch.arange(128, dtype=torch.int64),
+                indices_from_pool=None if name == PoolName.KV else PoolName.KV,
+            )
+            for name in names
         ]
 
-    def test_registering_a_sidecar_pool_refuses_to_start_the_backend(self):
-        """Rejecting at startup is what turns wrong output into a failed launch."""
-        store = _store(0, 1)
+    def test_each_pool_is_addressed_through_its_own_host_pool(self):
+        """The anchor forwards ``get_page_buffer_meta``, so a sidecar resolved
+        through ``mem_pool_host`` is handed KV addresses -- and reports success
+        after moving KV bytes into KV pages.
+        """
+        store = self._store_with_pools()
+        store._drain_until = lambda handle, timeout_s=None: {}
+        asked = []
+        for name, layout in store._pool_layouts.items():
+            inner = layout.host_pool.get_page_buffer_meta
+            layout.host_pool.get_page_buffer_meta = (
+                lambda indices, name=name, inner=inner: (
+                    asked.append(name) or inner(indices)
+                )
+            )
 
-        with self.assertRaises(RuntimeError) as raised:
-            store.register_mem_host_pool_v2(SimpleNamespace(), PoolName.INDEXER)
+        store.batch_set_v2(self._transfers())
 
-        self.assertIn("indexer", str(raised.exception))
+        self.assertEqual(sorted(asked), [str(PoolName.INDEXER), str(PoolName.KV)])
 
-    def test_a_sidecar_get_is_a_miss_and_never_reaches_the_core(self):
+    def test_two_pools_sharing_a_page_hash_get_distinct_block_keys(self):
+        """A sidecar transfer carries the KV pool's hashes, so keys that did not
+        carry the pool would collide and the second deposit would overwrite the
+        first's blocks -- leaving one pool reading the other's bytes.
+        """
+        store = self._store_with_pools()
+        deposited = []
+        store._kvcr = SimpleNamespace(
+            deposit=lambda descriptors: deposited.append(set(descriptors)) or 1
+        )
+        store._drain_until = lambda handle, timeout_s=None: {}
+
+        store.batch_set_v2(self._transfers())
+
+        kv_keys, sidecar_keys = deposited
+        self.assertEqual(kv_keys & sidecar_keys, set())
+
+    def test_an_unregistered_pool_is_a_miss_and_never_reaches_the_core(self):
         """Asserting the deliver never ran separates this guard from
         ``_fail_closed``, which would also produce all-False and is not the same fix.
         """
-        store = self._store_with_core()
+        store = self._store_with_pools()
         delivered = []
 
-        def record_and_succeed(transfer, request_id):
+        def record_and_succeed(transfer, layout, request_id):
             delivered.append(transfer.name)
             return [True] * len(transfer.keys)
 
         store._deliver_transfer = record_and_succeed
 
-        results = store.batch_get_v2(self._transfers())
+        results = store.batch_get_v2(self._transfers((PoolName.KV, PoolName.SWA)))
 
-        self.assertEqual(results[str(PoolName.INDEXER)], [False, False])
+        self.assertEqual(results[str(PoolName.SWA)], [False, False])
         self.assertEqual(delivered, [PoolName.KV])
 
-    def test_a_sidecar_pool_makes_the_whole_prefix_unavailable(self):
-        """``batch_exists_v2`` reports one ``kv_hit_pages`` for the request and the
-        controller issues gets for that prefix across all pools, so reporting the KV
-        pages held would promise sidecar pages this backend cannot serve.
+    def test_an_unregistered_pool_makes_the_whole_prefix_unavailable(self):
+        """``batch_exists_v2`` reports one prefix for the request and the
+        controller issues gets for it across all pools, so reporting the KV pages
+        held would promise pages this backend never wrote.
         """
-        store = self._store_with_core()
+        store = self._store_with_pools()
         store._kvcr = SimpleNamespace(
             query=lambda keys: [(QueryStatus.HIT, None)] * len(keys)
         )
 
-        result = store.batch_exists_v2(["p0", "p1"], self._transfers())
+        result = store.batch_exists_v2(
+            ["p0", "p1"], self._transfers((PoolName.KV, PoolName.SWA))
+        )
 
         self.assertEqual(result.kv_hit_pages, 0)
-        self.assertEqual(result.extra_pool_hit_pages, {})
+        self.assertEqual(result.restorable_prefix_pages, [])
+
+    def test_a_hinted_prefix_is_available_for_sidecars_too(self):
+        """A hint names page hashes, and a sidecar transfer carries the KV
+        page's hashes -- so the source deposited that page's sidecar blocks
+        under the same hash and they are pullable.
+
+        Scoring sidecars on local residency alone made this return 0 for every
+        sidecar: the prefix is one number across all pools, so nothing remote
+        was ever fetched on a hybrid model and the whole P2P path was dead
+        while KV-only stacks stayed green.
+        """
+        store = self._store_with_pools()
+        store._kvcr = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.MISS, None)] * len(keys)
+        )
+        page_keys = ["0123456789abcdef" + "00" * 8, "fedcba9876543210" + "00" * 8]
+        transfers = [
+            PoolTransfer(
+                name=name,
+                keys=page_keys,
+                host_indices=torch.arange(128, dtype=torch.int64),
+                indices_from_pool=None if name == PoolName.KV else PoolName.KV,
+            )
+            for name in (PoolName.KV, PoolName.INDEXER)
+        ]
+        extra_info = HiCacheStorageExtraInfo(
+            extra_info={
+                ROUTER_HINT_KEY: build_envelope(
+                    source_control_endpoint="tcp://10.0.0.7:25000",
+                    block_hashes=list(page_keys),
+                    message_id="hybrid-hint",
+                )
+            }
+        )
+
+        result = store.batch_exists_v2(page_keys, transfers, extra_info)
+
+        self.assertEqual(result.kv_hit_pages, 2)
+        self.assertEqual(result.extra_pool_hit_pages[str(PoolName.INDEXER)], 2)
+        self.assertEqual(result.restorable_prefix_pages, [1, 2])
+
+    def test_a_sidecar_short_of_the_kv_prefix_clamps_it(self):
+        """``ALL_PAGES``: the sidecar is required for every page of the prefix, so
+        a sidecar that holds only the first page caps the request at one.
+        """
+        store = self._store_with_pools()
+        kv = store._pool_layouts[str(PoolName.KV)]
+        indexer = store._pool_layouts[str(PoolName.INDEXER)]
+        held = set(
+            store._page_segment_keys(kv, "p0")
+            + store._page_segment_keys(kv, "p1")
+            + store._page_segment_keys(indexer, "p0")
+        )
+        store._kvcr = SimpleNamespace(
+            query=lambda keys: [
+                (QueryStatus.HIT if key in held else QueryStatus.MISS, None)
+                for key in keys
+            ]
+        )
+
+        result = store.batch_exists_v2(["p0", "p1"], self._transfers())
+
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(result.extra_pool_hit_pages[str(PoolName.INDEXER)], 1)
 
 
 @_needs_kvcr
@@ -531,8 +664,8 @@ class RemoteFailureTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.store = _store(0, 1)
-        self.store._segments_per_page = 1
-        self.store._slot_size = 16
+        self.store.register_mem_pool_host(_fake_pool(sizes=[16]))
+        self.layout = self.store._pool_layouts[str(PoolName.KV)]
 
     def _transfer(self, keys: List[str]) -> SimpleNamespace:
         """A PoolTransfer-alike whose host descriptors always resolve."""
@@ -543,14 +676,14 @@ class RemoteFailureTest(unittest.TestCase):
         that stands between a dead peer and a permanently wedged prefetch thread.
         """
         self.store._kvcr = FakeKVCR()  # finish() is never called
-        self.store._host_descriptors = lambda transfer: (
+        self.store._host_descriptors = lambda transfer, layout: (
             {"seg-a": object()},
             [["seg-a"]],
         )
 
         started = time.monotonic()
         results = self.store._deliver_transfer(
-            self._transfer(["page-a"]), request_id="req-1"
+            self._transfer(["page-a"]), self.layout, request_id="req-1"
         )
         elapsed = time.monotonic() - started
 
@@ -565,6 +698,7 @@ class RemoteFailureTest(unittest.TestCase):
         self.store._kvcr = FakeKVCR()
         self.store._locally_resident = lambda segment_keys: False
         extra_info = _hint_extra_info("tcp://10.0.0.7:25000")
+
 
         result = self.store.batch_exists_v2(
             ["hash-the-hint-does-not-cover"], extra_info=extra_info
@@ -590,10 +724,9 @@ class RaisingCoreTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.store = _store(0, 1)
-        self.store._segments_per_page = 1
-        self.store._slot_size = 16
+        self.store.register_mem_pool_host(_fake_pool(sizes=[16]))
         self.store._kvcr = _ExplodingKVCR()
-        self.store._host_descriptors = lambda transfer: (
+        self.store._host_descriptors = lambda transfer, layout: (
             {"seg-a": object()},
             [["seg-a"]],
         )
