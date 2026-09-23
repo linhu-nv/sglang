@@ -498,6 +498,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_length]
         self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
         self._commit_restore(req)
+        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
+            self.flexkv_connector.cancel_prefetch(
+                _request_key(req.cache_request_handle)
+            )
         if not is_insert:
             return
 

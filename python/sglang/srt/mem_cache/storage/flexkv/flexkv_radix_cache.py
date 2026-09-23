@@ -742,6 +742,12 @@ class FlexKVRadixCache(RadixCache):
             )
         super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
         self._commit_restore(req)
+        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
+            # Ordinary decode completion comes here, not through finish().
+            # GPU-hot requests never handed their unused lease to a held GET.
+            self.flexkv_connector.cancel_prefetch(
+                _request_key(req.cache_request_handle)
+            )
         # Late cleanup of an aborted Req must not release a new producer
         # that reused its rid while the old allocation was retained.
         if not self.has_uncommitted_restore(req):

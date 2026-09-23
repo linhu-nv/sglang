@@ -167,6 +167,46 @@ def test_finish_releases_unused_prefetch_only_on_chunked_success(
     assert "still-running" in stores
 
 
+@pytest.mark.parametrize(
+    "path,cls", [(SOURCE, "FlexKVRadixCache"), (HYBRID, "FlexKVHybridRadixCache")]
+)
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("is_insert", [False, True])
+@pytest.mark.parametrize("attempt", [0, 1])
+def test_cache_finished_req_releases_gpu_hot_prefetch(
+    path, cls, chunked, is_insert, attempt
+):
+    handle = CacheRequestHandle("reused-rid", attempt)
+    connector = Mock(_chunked_prefetch=chunked)
+    req = NS(
+        cache_request_handle=handle,
+        origin_input_ids=[],
+        output_ids=[],
+        kv=NS(kv_committed_len=0),
+    )
+    cache = NS(
+        flexkv_connector=connector,
+        _validate_restore_lease=Mock(),
+        _apply_restore_swa_boundary=Mock(),
+        _commit_restore=Mock(),
+        has_uncommitted_restore=lambda req: False,
+        _release_restore_prefix=Mock(),
+        _load_markers={},
+        _inner_cache=Mock(),
+        _store_prefix=Mock(),
+    )
+    finish = method(path, cls, "cache_finished_req")
+    finish.__globals__["super"] = lambda: Mock()
+    finish(cache, req, is_insert=is_insert, owned_kv_len=0)
+    cache._commit_restore.assert_called_once_with(req)
+    if chunked:
+        connector.cancel_prefetch.assert_called_once_with(
+            _tracking_key(handle.rid, handle.attempt_id)
+        )
+    else:
+        connector.cancel_prefetch.assert_not_called()
+
+
 def test_prefetch_stats_pass_through():
     connector = Mock(_chunked_prefetch=True)
     connector.pop_prefetch_loaded_span.return_value = (16, 32)
