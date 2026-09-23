@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     EvictParams,
     EvictResult,
@@ -743,6 +744,15 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 if tracked is not None:
                     node, dec_params = tracked
                     self._inner_cache.dec_lock_ref(node, dec_params)
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        super().finish(handle, outcome)
+        if outcome == CacheRequestOutcome.SUCCESS and getattr(
+            self.flexkv_connector, "_chunked_prefetch", False
+        ):
+            # A full GPU hit never takes a held GET reference. Release that
+            # attempt's unused prefetch lease without cancelling async STOREs.
+            self.flexkv_connector.cancel_prefetch(_request_key(handle))
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         rid = _request_key(handle)

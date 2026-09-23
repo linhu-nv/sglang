@@ -45,6 +45,7 @@ from flexkv.integration.sglang.connector import (
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
+    CacheRequestOutcome,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -1009,6 +1010,16 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
     # Optional pass-throughs used by the scheduler
     # ------------------------------------------------------------------
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        super().finish(handle, outcome)
+        if outcome == CacheRequestOutcome.SUCCESS and getattr(
+            self.flexkv_connector, "_chunked_prefetch", False
+        ):
+            # GPU-only hits bypass held GET, so no lookup hands off/releases
+            # their prefetch lease. The finished attempt no longer needs it.
+            # cancel_prefetch leaves the asynchronous STORE ledger untouched.
+            self.flexkv_connector.cancel_prefetch(_request_key(handle))
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         """Release admission tracking without polling launched transfers."""

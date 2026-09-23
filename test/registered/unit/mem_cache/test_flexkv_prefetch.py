@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
     CacheRequestHandle,
     CacheRequestOutcome,
 )
@@ -130,6 +131,40 @@ def test_abort_releases_flexkv_without_hicache_enabled():
     cache.finish.assert_called_once_with(
         CacheRequestHandle("r", 0), CacheRequestOutcome.ABORT
     )
+
+
+@pytest.mark.parametrize(
+    "path,cls", [(SOURCE, "FlexKVRadixCache"), (HYBRID, "FlexKVHybridRadixCache")]
+)
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("outcome", list(CacheRequestOutcome))
+@pytest.mark.parametrize("attempt", [0, 1])
+def test_finish_releases_unused_prefetch_only_on_chunked_success(
+    path, cls, chunked, outcome, attempt
+):
+    handle = CacheRequestHandle("reused-rid", attempt)
+    stores = {"still-running": object()}
+    connector = Mock(_chunked_prefetch=chunked, _inflight_stores=stores)
+    cache = NS(flexkv_connector=connector, release_aborted_request=Mock())
+    finish = method(path, cls, "finish")
+    # Execute the real base finish contract as the extracted method's super.
+    base_finish = Mock(side_effect=lambda h, o: BasePrefixCache.finish(cache, h, o))
+    finish.__globals__["super"] = lambda: NS(finish=base_finish)
+    finish(cache, handle, outcome)
+    base_finish.assert_called_once_with(handle, outcome)
+    if outcome == CacheRequestOutcome.SUCCESS:
+        cache.release_aborted_request.assert_not_called()
+        if chunked:
+            connector.cancel_prefetch.assert_called_once_with(
+                _tracking_key(handle.rid, handle.attempt_id)
+            )
+        else:
+            connector.cancel_prefetch.assert_not_called()
+    else:
+        cache.release_aborted_request.assert_called_once_with(handle)
+        connector.cancel_prefetch.assert_not_called()
+    assert connector._inflight_stores is stores
+    assert "still-running" in stores
 
 
 def test_prefetch_stats_pass_through():
