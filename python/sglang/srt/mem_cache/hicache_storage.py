@@ -178,6 +178,14 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # Whether each TP rank's instance holds its own copy of the data. An MLA
+    # model's KV is identical on every rank, so the controller has only rank 0
+    # back it up -- correct for a shared namespace, where the other ranks read
+    # rank 0's write. A rank-local tier has no such shared copy: skipping the
+    # backup leaves ranks 1..n-1 with nothing, and since the prefix is reduced
+    # across ranks, every lookup then resolves to zero.
+    rank_local_namespace: bool = False
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host

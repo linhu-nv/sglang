@@ -597,6 +597,11 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.storage_host_pool
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            if self.storage_backend.rank_local_namespace:
+                # Only rank 0 wrote, but on a rank-local tier the other ranks
+                # cannot read that write, and the prefix is reduced across
+                # ranks -- so skipping the backup makes every lookup miss.
+                self.backup_skip = False
 
             self.enable_storage = True
             # todo: threshold policy for prefetching

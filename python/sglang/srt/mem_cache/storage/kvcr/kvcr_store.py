@@ -53,6 +53,12 @@ KVCR local-DRAM pool, since KVCR sizes a pool's slots uniformly and rejects a
 descriptor whose size does not match its pool's; a sidecar page's segments are
 keyed ``<page>#<pool>:<seg>`` so they never collide with the KV page's. See
 ``_kvcr_pools``.
+
+DeepSeek V4 goes one step further: its KV pool is a pure page anchor holding no
+KV bytes at all, and every byte lives in the sidecars. The anchor still has to
+store and load, because the controller gates all sidecar IO on the KV pool
+completing, so it is served a constant marker block per page -- see
+``_logical_anchor_layout``.
 """
 
 from __future__ import annotations
@@ -161,6 +167,15 @@ _IDLE_TICK_INTERVAL_MS = 1
 # size, which keeps a KV-only stack byte-identical to the single-pool backend.
 _ANONYMOUS_POOL_NAME = ""
 
+# One logical-anchor page's marker block, in bytes. DeepSeek V4's KV pool owns
+# page indices and no KV bytes, but its key still has to be deposited and
+# delivered so the controller's sidecar gate opens -- see
+# ``_logical_anchor_layout`` -- so every anchor page gets a block this size.
+# Arbitrary; small enough that the whole marker buffer stays under a megabyte
+# for any real pool. Both peers derive it from this constant, so a remote
+# fetch's source and destination descriptor lists agree.
+_ANCHOR_MARKER_BYTES = 64
+
 # The only transport KVCR's ZMQ control channel can dial a peer over, and the
 # bind wildcards that are legal to bind but cannot be dialed. Loopback is *not*
 # here: colocated workers are the normal single-host topology. A hint arrives
@@ -228,6 +243,10 @@ class _PoolLayout(msgspec.Struct, frozen=True):
     ``key_prefix`` disambiguates two pools' segments under one page hash. It is
     empty for KV, which keeps a KV-only stack's keys byte-identical to what the
     single-pool backend wrote (and what a deployed peer expects on the wire).
+
+    ``marker_buffer`` is set only for a logical anchor (see
+    ``_logical_anchor_layout``) and is then the pool's whole byte backing: the
+    host pool itself holds none, so this is what descriptors address.
     """
 
     name: str
@@ -235,6 +254,7 @@ class _PoolLayout(msgspec.Struct, frozen=True):
     segment_sizes: Tuple[int, ...]
     kvcr_pool_names: Tuple[str, ...]
     key_prefix: str
+    marker_buffer: Optional[torch.Tensor] = None
 
     @property
     def segments_per_page(self) -> int:
@@ -243,6 +263,10 @@ class _PoolLayout(msgspec.Struct, frozen=True):
     @property
     def bytes_per_page(self) -> int:
         return sum(self.segment_sizes)
+
+    @property
+    def is_logical_anchor(self) -> bool:
+        return self.marker_buffer is not None
 
 
 def _kvcr_pool_name(pool_name: str, segment_size: int, uniform: bool) -> str:
@@ -492,6 +516,10 @@ def _ephemeral_port() -> int:
 
 class KVCRStore(HiCacheStorage):
     """HiCacheStorage backend backed by the KVCR P2P coordinator (draft)."""
+
+    # Each rank runs its own core over its own local DRAM tier, so a page one
+    # rank deposits is invisible to the others.
+    rank_local_namespace = True
 
     def __init__(
         self,
@@ -940,7 +968,14 @@ class KVCRStore(HiCacheStorage):
         buffers: List[torch.Tensor] = []
         seen: Set[Tuple[int, int]] = set()
         for layout in self._pool_layouts.values():
-            for buffer in layout.host_pool.get_hybrid_pool_buffer() or []:
+            # A logical anchor's pages live in the marker buffer this backend
+            # allocated for it, not in the pool -- which owns no bytes at all.
+            pool_buffers = (
+                [layout.marker_buffer]
+                if layout.is_logical_anchor
+                else layout.host_pool.get_hybrid_pool_buffer() or []
+            )
+            for buffer in pool_buffers:
                 if not isinstance(buffer, torch.Tensor) or buffer.numel() == 0:
                     continue
                 identity = (buffer.data_ptr(), buffer.numel() * buffer.element_size())
@@ -1128,6 +1163,8 @@ class KVCRStore(HiCacheStorage):
         fail every deposit for that pool individually, which reads downstream as
         "the cache never hits" rather than "the backend is unusable".
         """
+        if self._is_logical_anchor(host_pool):
+            return self._logical_anchor_layout(name, host_pool)
         sizes = self._probe_page_component_sizes(name, host_pool)
         self._probe_pool_buffers(name, host_pool)
         uniform = len(set(sizes)) == 1
@@ -1142,6 +1179,65 @@ class KVCRStore(HiCacheStorage):
             # and only to keep its segments from colliding with the KV page's
             # under the same page hash.
             key_prefix="" if name == str(PoolName.KV) else f"{name}:",
+        )
+
+    @staticmethod
+    def _is_logical_anchor(host_pool: HostKVCache) -> bool:
+        """Whether this pool anchors pages for sidecars and holds no bytes itself.
+
+        DeepSeek V4's KV pool is a ``LogicalHostPool``: it allocates page-aligned
+        token slots that the compressed side pools use as stable page anchors,
+        but it owns no KV tensor, so ``kv_buffer`` is None and
+        ``get_page_buffer_meta`` returns None by design. Every other pool this
+        backend serves answers both.
+        """
+        return getattr(host_pool, "kv_buffer", None) is None
+
+    def _logical_anchor_layout(self, name: str, host_pool: HostKVCache) -> _PoolLayout:
+        """Layout for a bytes-free anchor, backed by a marker block per page.
+
+        The anchor cannot simply be skipped. ``_page_transfer_sidecar`` runs a
+        sidecar's IO only when the KV pool reported every page of the operation
+        complete, so an anchor that always misses would leave DeepSeek V4's real
+        KV -- which lives entirely in the sidecars -- never stored and never
+        loaded, with no error anywhere.
+
+        So the anchor gets one small block per page, the same shape every other
+        pool has: one segment, deposited and delivered like any other, which
+        makes its key a real residency record in the core rather than a special
+        case the query path has to know about. The bytes are a constant marker;
+        only the key's presence carries meaning.
+
+        The marker buffer is one tensor for the whole pool with a distinct
+        per-page slot, not one shared slot: deposit and deliver hand KVCR
+        descriptors into it, and a remote deliver writes through them, so two
+        pages sharing an address would have concurrent transfers writing the
+        same bytes. The buffer is held on the layout so NIXL's registration
+        stays valid for as long as the layout does.
+        """
+        page_size = getattr(host_pool, "page_size", None)
+        if not page_size:
+            raise RuntimeError(
+                f"KVCRStore: logical anchor pool '{name}' reports no page size, "
+                "so its pages cannot be given marker blocks."
+            )
+        pages = int(getattr(host_pool, "size", 0)) // int(page_size)
+        if pages < 1:
+            raise RuntimeError(
+                f"KVCRStore: logical anchor pool '{name}' holds no whole page "
+                f"(size={getattr(host_pool, 'size', 0)}, page_size={page_size})."
+            )
+        marker = torch.empty(pages, _ANCHOR_MARKER_BYTES, dtype=torch.uint8)
+        # Deposited as-is, so it must be initialized: uninitialized bytes would
+        # be read by NIXL and, on a peer fetch, shipped over the wire.
+        marker.fill_(1)
+        return _PoolLayout(
+            name=name,
+            host_pool=host_pool,
+            segment_sizes=(_ANCHOR_MARKER_BYTES,),
+            kvcr_pool_names=(_kvcr_pool_name(name, _ANCHOR_MARKER_BYTES, True),),
+            key_prefix="" if name == str(PoolName.KV) else f"{name}:",
+            marker_buffer=marker,
         )
 
     def _probe_page_component_sizes(
@@ -1347,6 +1443,9 @@ class KVCRStore(HiCacheStorage):
         # looked exactly like a target that quietly fetched nothing.
         self._note("deposit_pages_offered", len(keys))
         self._note("deposit_pages_stored", sum(results))
+        # Per pool as well as in total: a hybrid model deposits one page across
+        # seven pools, and the totals cannot show which of them stopped storing.
+        self._note(f"deposit_{transfer.name}", sum(results))
         return results
 
     def _host_descriptors(
@@ -1375,6 +1474,8 @@ class KVCRStore(HiCacheStorage):
         keys = transfer.keys or []
         if host_indices is None or not keys:
             return None
+        if layout.is_logical_anchor:
+            return self._anchor_descriptors(host_indices, keys, layout)
         try:
             ptr_list, size_list = layout.host_pool.get_page_buffer_meta(host_indices)
         except Exception:
@@ -1428,6 +1529,61 @@ class KVCRStore(HiCacheStorage):
                     )
                 ]
             per_page_keys.append(page_keys)
+        return descriptors, per_page_keys
+
+    def _anchor_descriptors(
+        self,
+        host_indices: torch.Tensor,
+        keys: List[str],
+        layout: _PoolLayout,
+    ) -> Optional[Tuple[Dict[BlockKey, List[MemDescriptor]], List[List[BlockKey]]]]:
+        """``_host_descriptors`` for a logical anchor: one marker block per page.
+
+        The anchor's transfer carries host indices into a pool that holds no
+        bytes, so the marker buffer this backend allocated is what a descriptor
+        can name. Each page addresses the marker slot matching its own host
+        page, mirroring how a real pool's page meta resolves -- HiCache holds a
+        host page for the life of a transfer, so two in-flight transfers cannot
+        be handed the same slot and cannot alias in the buffer.
+        """
+        page_size = int(layout.host_pool.page_size)
+        marker = layout.marker_buffer
+        if len(host_indices) != len(keys) * page_size:
+            logger.warning(
+                "KVCRStore: anchor pool %s got %d host indices for %d pages of "
+                "%d slots",
+                layout.name,
+                len(host_indices),
+                len(keys),
+                page_size,
+            )
+            return None
+        descriptors: Dict[BlockKey, List[MemDescriptor]] = {}
+        per_page_keys: List[List[BlockKey]] = []
+        for page_idx, key in enumerate(keys):
+            slot = int(host_indices[page_idx * page_size]) // page_size
+            if not 0 <= slot < marker.shape[0]:
+                logger.warning(
+                    "KVCRStore: anchor pool %s page %d maps to marker slot %d, "
+                    "outside the %d the pool declared",
+                    layout.name,
+                    page_idx,
+                    slot,
+                    marker.shape[0],
+                )
+                return None
+            segment_key = self._segment_key(layout, key, 0)
+            per_page_keys.append([segment_key])
+            descriptors[segment_key] = [
+                MemDescriptor(
+                    end_point_name=self._agent_name,
+                    mem_type="DRAM",
+                    addr=marker[slot].data_ptr(),
+                    size=_ANCHOR_MARKER_BYTES,
+                    device_Id=0,
+                    info=layout.kvcr_pool_names[0],
+                )
+            ]
         return descriptors, per_page_keys
 
     @_fail_closed(_miss_per_transfer)
@@ -1754,6 +1910,12 @@ class KVCRStore(HiCacheStorage):
         # issues gets for the prefix reported here, so a hint that covers
         # nothing produces no get at all and leaves no other trace.
         self._note("exists_calls")
+        if keys and not restorable:
+            # One pool reporting nothing zeroes the whole prefix, and the
+            # aggregate counters cannot say which -- the KV anchor missing and
+            # a single sidecar collapsing the intersection look identical.
+            self._note("exists_miss_pages", len(keys))
+            self._note("exists_miss_kv" if not kv_pages else "exists_miss_sidecar")
         if remote_prefix is not None:
             self._note("exists_with_hint")
             if remote_prefix:
