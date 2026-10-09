@@ -20,6 +20,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
     PrefetchAck,
+    _kv_hints_extra_info,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -710,7 +711,14 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+            # Same hints as the KV fetch: a trailing sidecar the peer holds is
+            # reachable only through them, and without them a backend that
+            # resolves misses remotely reports this pool short and the whole
+            # hybrid prefetch is discarded.
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=operation.prefix_keys,
+                extra_info=_kv_hints_extra_info(operation),
+            )
             results = self.storage_backend.batch_get_v2(
                 transfers_nonkv, extra_info=extra_info
             )
