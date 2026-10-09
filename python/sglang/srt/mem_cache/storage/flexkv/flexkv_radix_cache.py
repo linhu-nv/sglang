@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.storage.flexkv.kv_event_bridge import FlexKVEventBridge
 from sglang.srt.mem_cache.storage.flexkv.namespace import (
     NamespacedFlexKVConnector,
     cache_namespace,
@@ -225,6 +226,14 @@ class FlexKVRadixCache(RadixCache):
         self._aborted_restore_leases: dict[int, _RestoreLease] = {}
         self._restore_generation = 0
         self._node_lock = threading.Lock()
+
+        # Publish the FlexKV host tier on sglang's KV event channel so a
+        # KV-aware router scores this engine on what it can actually serve,
+        # not just on what is resident on the device.
+        self._kv_event_bridge = FlexKVEventBridge(
+            self.flexkv_connector, self.kv_events, self.page_size
+        )
+        self._kv_event_bridge.start()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1019,6 +1028,9 @@ class FlexKVRadixCache(RadixCache):
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
         self._launch_pending_stores()
+        # Host-tier placement events ride out on the scheduler's own
+        # publish_kv_events, which runs on this same tick.
+        self._kv_event_bridge.drain()
 
     def _drain_completed_stores(self) -> None:
         completed_handles = self.flexkv_connector.check_completed_stores()

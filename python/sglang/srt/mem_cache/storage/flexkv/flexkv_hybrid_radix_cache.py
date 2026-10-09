@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.flexkv.kv_event_bridge import FlexKVEventBridge
 from sglang.srt.mem_cache.storage.flexkv.namespace import (
     NamespacedFlexKVConnector,
     cache_namespace,
@@ -173,6 +174,16 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._node_lock = threading.Lock()
 
         self._swa_grid_tokens = envs.SGLANG_FLEXKV_SWA_GRID_PAGES.get() * self.page_size
+        # Publish the FlexKV host tier on sglang's KV event channel. The
+        # recorder belongs to the inner cache — this composes onto its queue
+        # rather than opening a second one, so the router still sees one
+        # ordered stream per engine.
+        self._kv_event_bridge = FlexKVEventBridge(
+            self.flexkv_connector,
+            getattr(inner_cache, "kv_events", None),
+            self.page_size,
+        )
+        self._kv_event_bridge.start()
 
     def reset(self) -> None:
         # Mapping copies may still be staged outside the connector. Wait for
@@ -744,6 +755,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
         self._launch_pending_stores()
+        self._kv_event_bridge.drain()
 
     def _drain_completed_stores(self) -> None:
         completed = self.flexkv_connector.check_completed_stores()

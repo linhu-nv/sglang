@@ -33,6 +33,19 @@ from sglang.srt.mem_cache.utils import (
 )
 
 
+def _to_signed_int64(value: int) -> int:
+    """Wrap an unsigned 64-bit hash into the signed range.
+
+    Native hashes (FlexKV's xxhash, radixshmem's) are unsigned; every hash on
+    this wire is signed, because that is what ``hash_str_to_int64`` produces
+    for sglang's own events. Applying the same wrap to both the store and the
+    remove keeps them equal — which is all a consumer needs, since it never
+    interprets a hash, only matches one.
+    """
+    value = int(value) & 0xFFFFFFFFFFFFFFFF
+    return value - 2**64 if value >= 2**63 else value
+
+
 class KVCacheEventRecorder:
     """Collects KV placement events for one cache.
 
@@ -174,6 +187,68 @@ class KVCacheEventRecorder:
 
         if block_hashes:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+
+    def record_external_store(
+        self,
+        block_hashes: list,
+        token_ids: list,
+        parent_block_hash=None,
+        medium=None,
+    ) -> None:
+        """Record blocks stored by a tier that has no radix node here.
+
+        An external tier (FlexKV's host cache, a shared KV pool) hashes with
+        its own scheme, so the hashes cannot be derived from this cache's
+        tree — the tier supplies them, along with the tokens each covers.
+        The tokens are what let a content-addressing router equate the two
+        hash spaces; without them the router can route to this engine only
+        for prefixes it happens to have seen stored on the device tier.
+
+        ``block_hashes[i]`` covers ``token_ids[i]``, in path order.
+        ``parent_block_hash`` links the first block back to the one before
+        it, or is None when the batch starts at the path root.
+        """
+        if not self.enabled or not block_hashes:
+            return
+        if len(block_hashes) != len(token_ids):
+            raise ValueError(
+                f"external store: {len(block_hashes)} hashes but "
+                f"{len(token_ids)} token blocks"
+            )
+        if medium is None:
+            medium = StorageMedium.GPU
+        if parent_block_hash is not None:
+            parent_block_hash = _to_signed_int64(parent_block_hash)
+
+        for block_hash, page_tokens in zip(block_hashes, token_ids):
+            page_tokens = list(page_tokens)
+            block_hash = _to_signed_int64(block_hash)
+            self.enqueue(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                    medium=medium,
+                )
+            )
+            parent_block_hash = block_hash
+
+    def record_external_remove(self, block_hashes: list, medium=None) -> None:
+        """Record blocks dropped by an external tier. Hash-only: eviction
+        happens where the tokens are long gone, and a consumer resolves the
+        hashes through the mapping the matching store established."""
+        if not self.enabled or not block_hashes:
+            return
+        if medium is None:
+            medium = StorageMedium.GPU
+        self.enqueue(
+            BlockRemoved(
+                block_hashes=[_to_signed_int64(h) for h in block_hashes],
+                medium=medium,
+            )
+        )
 
     def record_all_cleared(self) -> None:
         if not self.enabled:
