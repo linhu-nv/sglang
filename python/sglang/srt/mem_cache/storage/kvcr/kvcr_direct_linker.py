@@ -116,11 +116,30 @@ class _Offload:
 
 
 @dataclass
+class _Confirm:
+    active: int = 0
+    claims: list = field(default_factory=list)
+    success: bool = True
+    exhausted: bool = False
+
+
+@dataclass
 class _Operation:
     owner: _Batch | _Offload
     keys: set[bytes]
     layer: int | None = None
     result: object = None
+
+
+def _present(status, tier):
+    return (status.value, tier.value if tier is not None else None) in (
+        ("HIT", "DRAM"),
+        ("FETCHABLE", "REMOTE_G2"),
+    )
+
+
+def _remote(status, tier):
+    return status.value == "FETCHABLE" and tier is not None and tier.value == "REMOTE_G2"
 
 
 def _snapshot_indices(transfers):
@@ -236,6 +255,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._hazards = set()
         self._scopes = {}
         self._request_scopes = {}
+        self._confirmed = {}
         self._released_scopes = set()
         self._fatal = None
         self._closed = False
@@ -359,6 +379,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if scope is not None:
             if self._request_scopes.get(handle.rid) == scope:
                 self._request_scopes.pop(handle.rid)
+            self._confirmed.pop(scope, None)
             self._released_scopes.add(scope)
             self._cleanup_scopes()
 
@@ -378,19 +399,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return self._call(self._lookup, rid, keys, prepared)
 
     def _lookup(self, rid, keys, prepared):
-        valid = set(range(1, len(keys) + 1))
+        scope = self._request_scopes.get(rid)
+        statuses = {}
         for transfer in prepared:
             encoded = [self.layout.encode_key(key, transfer.name) for key in keys]
-            result = self._runtime.client.query(
-                encoded, request_id=self._request_scopes.get(rid)
-            )
+            result = self._runtime.client.query(encoded, request_id=scope)
             if len(result) != len(encoded):
                 raise RuntimeError("KVCR query returned an incomplete result")
-            hits = [
-                (status.value, tier.value if tier is not None else None)
-                in (("HIT", "DRAM"), ("FETCHABLE", "REMOTE_G2"))
-                for status, tier in result
-            ]
+            statuses[transfer.name] = (encoded, result)
+        if scope is not None:
+            self._confirm_trailing(scope, prepared, statuses)
+        valid = set(range(1, len(keys) + 1))
+        for transfer in prepared:
+            _, result = statuses[transfer.name]
+            hits = [_present(*entry) for entry in result]
             missing = [0]
             for hit in hits:
                 missing.append(missing[-1] + (not hit))
@@ -406,6 +428,86 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 ]
             }
         return sorted(valid)
+
+    def _confirm_trailing(self, scope, prepared, statuses):
+        """Admit a remote trailing page only after it has been fetched.
+
+        A hint names page hashes, so query() answers FETCHABLE for every pool's
+        key under them, but a trailing pool (SWA, compress state) has state on
+        the peer only where it stored a sequence end or chunk boundary. A
+        delivery that misses one fails after the tree has committed to it. Only
+        the longest boundary the all-pages pools allow is worth restoring, so
+        fetch that boundary's trailing window and report every other remote
+        trailing page missing.
+        """
+        from kvcr.types import QueryStatus
+
+        trailing = [t for t in prepared if t.hit_policy != PoolHitPolicy.ALL_PAGES]
+        if not trailing:
+            return
+        longest = min(
+            (
+                next(
+                    (
+                        index
+                        for index, entry in enumerate(statuses[t.name][1])
+                        if not _present(*entry)
+                    ),
+                    len(statuses[t.name][1]),
+                )
+                for t in prepared
+                if t.hit_policy == PoolHitPolicy.ALL_PAGES
+            ),
+            default=len(statuses[trailing[0].name][1]),
+        )
+        confirmed = self._confirmed.setdefault(scope, set())
+        owner = _Confirm()
+        operations = []
+        for transfer in trailing:
+            encoded, result = statuses[transfer.name]
+            window = range(max(0, longest - max(1, len(transfer.keys))), longest)
+            keys = [
+                encoded[index]
+                for index in window
+                if _remote(*result[index]) and encoded[index] not in confirmed
+            ]
+            if not keys:
+                continue
+            labels = [
+                label
+                for component in self.layout._labels[transfer.name]
+                for label in component
+            ]
+            handle = self._runtime.client.fetch(
+                keys, request_id=scope, expected_layout=labels
+            )
+            operation = _Operation(owner, set(keys))
+            self._operations[handle] = operation
+            operations.append(operation)
+            owner.active += 1
+        while owner.active:
+            self._progress()
+            time.sleep(0)
+        # A fetch dropped locally never asks the peer, so only a page that
+        # landed counts; KVCR would keep answering FETCHABLE for the rest.
+        for operation in operations:
+            confirmed.update(
+                key for key, entry in (operation.result or {}).items() if entry.success
+            )
+        if owner.claims:
+            self._runtime.client.release(owner.claims)
+        for transfer in trailing:
+            encoded, _ = statuses[transfer.name]
+            result = self._runtime.client.query(encoded, request_id=scope)
+            statuses[transfer.name] = (
+                encoded,
+                [
+                    (QueryStatus.MISS, None)
+                    if _remote(*entry) and key not in confirmed
+                    else entry
+                    for key, entry in zip(encoded, result)
+                ],
+            )
 
     def load(self, rid, transfers):
         prepared = self.layout.prepare(
