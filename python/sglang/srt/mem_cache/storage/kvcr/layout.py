@@ -137,6 +137,18 @@ class KVCRLayout:
             return None
         return pool_name, storage_hash
 
+    def encoded_keys(
+        self, transfers: list[PoolTransfer], *, allow_partial: bool = False
+    ) -> set[bytes]:
+        """Storage keys of a transfer set without reading device indices."""
+        return {
+            self.encode_key(key, transfer.name)
+            for transfer in self.group.resolve_transfers(
+                transfers, allow_partial=allow_partial
+            )
+            for key in transfer.keys
+        }
+
     def prepare(
         self,
         transfers: list[PoolTransfer],

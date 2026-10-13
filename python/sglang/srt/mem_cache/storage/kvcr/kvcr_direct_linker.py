@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import socket
@@ -120,6 +121,26 @@ class _Operation:
     keys: set[bytes]
     layer: int | None = None
     result: object = None
+
+
+def _snapshot_indices(transfers):
+    """Clone index tensors on the stream; the tree may reuse the originals."""
+    return tuple(
+        dataclasses.replace(
+            transfer,
+            device_indices=(
+                transfer.device_indices.clone()
+                if isinstance(transfer.device_indices, torch.Tensor)
+                else transfer.device_indices
+            ),
+            host_indices=(
+                transfer.host_indices.clone()
+                if isinstance(transfer.host_indices, torch.Tensor)
+                else transfer.host_indices
+            ),
+        )
+        for transfer in transfers
+    )
 
 
 def _offset_source_ports(hints, offset):
@@ -436,13 +457,16 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             yield layer, None, None
 
     def offload(self, transfers):
-        prepared = self.layout.prepare(transfers, allow_partial=True)
-        if not prepared:
+        # Resolving device indices to rows copies them to the host, which here
+        # would wait for every forward already queued on the stream. Snapshot
+        # them instead; the preparer resolves them once the ready event fires.
+        keys = self.layout.encoded_keys(transfers, allow_partial=True)
+        if not keys:
             return False
+        transfers = _snapshot_indices(transfers)
         ready = torch.cuda.Event()
         ready.record()
-        keys = {key for transfer in prepared for key in transfer.keys}
-        self._send(self._offload, prepared, ready, keys)
+        self._send(self._offload, transfers, ready, keys)
         self._unacknowledged_keys.update(keys)
         return True
 
@@ -452,8 +476,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
 
     def _offload_work(self, transfers):
+        prepared = self.layout.prepare(list(transfers), allow_partial=True)
         for layer in range(self.pool_group.num_layers):
-            yield from self.layout.mappings(transfers, layer)
+            yield from self.layout.mappings(prepared, layer)
 
     def _fail_batch(self, batch, error):
         batch.error = error
