@@ -122,6 +122,24 @@ class _Operation:
     result: object = None
 
 
+def _offset_source_ports(hints, offset):
+    """Point each kv.fetch source endpoint ``offset`` control ports up.
+
+    Every rank listens on ``control_port + rank``, so this names the source
+    rank with the same number as the caller.
+    """
+    for action in hints.get("actions", ()):
+        payload = action.get("payload") if isinstance(action, dict) else None
+        endpoint = (
+            payload.get("source_control_endpoint") if isinstance(payload, dict) else None
+        )
+        if isinstance(endpoint, str):
+            host, sep, port = endpoint.rpartition(":")
+            if sep and port.isdigit():
+                payload["source_control_endpoint"] = f"{host}:{int(port) + offset}"
+    return hints
+
+
 class KVCRDirectLinker(UnifiedCacheLinker):
     loaded_path_is_stored = False
     local_storage_medium = StorageMedium.CPU
@@ -145,6 +163,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._remote_hints_supported = params.attn_cp_size == params.pp_size == 1 and (
             tp_size == 1 or self.pool_group.rank_replicated
         )
+        # The router names one control endpoint per source worker, its rank 0.
+        # Rank-replicated pools are identical on every source rank, so pulling
+        # from the same-numbered rank spreads a restore over all source ranks
+        # and their NICs instead of serializing it on rank 0.
+        self._source_rank_offset = tp_rank if self.pool_group.rank_replicated else 0
         if not self._remote_hints_supported:
             logger.warning(
                 "KVCR remote hints disabled: this layout requires shard-specific "
@@ -296,6 +319,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._scopes[handle] = scope
         self._request_scopes[handle.rid] = scope
         if hints is not None and self._remote_hints_supported:
+            if self._source_rank_offset:
+                hints = _offset_source_ports(hints, self._source_rank_offset)
             try:
                 self._runtime.client.submit_hint(hints, request_id=scope)
             except ValueError as error:
