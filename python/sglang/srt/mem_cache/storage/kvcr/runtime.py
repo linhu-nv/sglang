@@ -63,6 +63,7 @@ class KVCRRuntime:
             "operation_timeout_ms": 1000,
             "abandon_timeout_ms": 5000,
             "enable_telemetry": False,
+            "trailing_capacity_divisor": 1,
         }
         unknown = options.keys() - defaults.keys()
         if unknown:
@@ -92,10 +93,23 @@ class KVCRRuntime:
             or size_gb <= 0
         ):
             raise ValueError("KVCR dram_size_gb must be finite and positive")
+        divisor = config["trailing_capacity_divisor"]
+        if type(divisor) is not int or divisor < 1:
+            raise ValueError("KVCR trailing_capacity_divisor must be a positive integer")
+        # KVCR evicts per pool, so an equal page count per pool lets a sparsely
+        # written trailing pool hold most of the budget while the all-pages
+        # pools evict. Trailing pools get page_count // divisor pages instead.
         page_bytes = sum(
-            size * layout.pool_counts[name] for name, size in layout.pool_layouts
+            size
+            * (
+                layout.pool_counts[name]
+                - layout.trailing_counts[name]
+                + layout.trailing_counts[name] / divisor
+            )
+            for name, size in layout.pool_layouts
         )
-        page_count = int(size_gb * (1 << 30)) // page_bytes
+        page_count = int(int(size_gb * (1 << 30)) // page_bytes)
+        trailing_pages = max(1, page_count // divisor)
         if page_count < 1:
             raise ValueError("KVCR DRAM capacity must fit at least one complete page")
         for name in ("control_port", "nixl_port"):
@@ -208,7 +222,11 @@ class KVCRRuntime:
                     logger.warning("%s; using in-process KVCR DRAM", error)
             pools = []
             for name, size in layout.pool_layouts:
-                length = page_count * layout.pool_counts[name] * size
+                length = (
+                    page_count
+                    * (layout.pool_counts[name] - layout.trailing_counts[name])
+                    + trailing_pages * layout.trailing_counts[name]
+                ) * size
                 buffer = mmap.mmap(-1, length)
                 self._buffers.append(buffer)
                 address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))

@@ -57,6 +57,7 @@ are strict; unknown names fail startup.
 | `nixl_port` | `20500` | Base NIXL port; the global rank is added. |
 | `operation_timeout_ms` | `1000` | Positive operation deadline in milliseconds. |
 | `abandon_timeout_ms` | `5000` | Failure-reporting deadline, at least twice the operation timeout. |
+| `trailing_capacity_divisor` | `1` | In-process DRAM: trailing pools (SWA, compress state) get `1/N` of the pages of the other pools. |
 | `enable_telemetry` | `false` | Log aggregate KVCR timings, counters, and state at INFO every five seconds and on close/reset. |
 
 ## Guard memory and fallback

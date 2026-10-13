@@ -45,6 +45,9 @@ class KVCRLayout:
         self.endpoint_name = endpoint_name
         self.registrations: list[RegionDescriptor] = []
         self.pool_counts: Counter[str] = Counter()
+        # Pieces of pools keyed by SWA pages. Those are written only at sequence
+        # ends and chunk boundaries, so they need far fewer resident pages.
+        self.trailing_counts: Counter[str] = Counter()
         self._labels: dict[PoolName, tuple[tuple[str, ...], ...]] = {}
         pool_sizes = {}
         geometry = []
@@ -72,6 +75,8 @@ class KVCRLayout:
                     label = f"{pool}:c{component_index}.b{buffer_index}"
                     pool_sizes[pool] = size
                     self.pool_counts[pool] += 1
+                    if entry.indices_from_pool == PoolName.SWA:
+                        self.trailing_counts[pool] += 1
                     self.registrations.append(
                         RegionDescriptor(
                             mem_type="VRAM",
