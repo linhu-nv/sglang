@@ -169,10 +169,7 @@ class _SplitLayerGather:
         probe = torch.zeros(self.size, dtype=torch.uint8, device=self.device)
         torch.distributed.all_gather_into_tensor(probe, probe[self.rank : self.rank + 1], group=group)
 
-    def owner(self, page):
-        return page % self.size
-
-    def prepare(self, indices_by_pool):
+    def prepare(self, indices_by_pool, owners_by_pool):
         """Rows per pool, split by owner rank and padded to equal length."""
         prepared = {}
         for name, indices in indices_by_pool.items():
@@ -181,7 +178,8 @@ class _SplitLayerGather:
                 dtype=torch.int64,
                 device=self.device,
             )
-            per_rank = [rows[r :: self.size] for r in range(self.size)]
+            owners = torch.as_tensor(owners_by_pool[name], device=self.device)
+            per_rank = [rows[owners == r] for r in range(self.size)]
             width = max(part.numel() for part in per_rank)
             if width == 0:
                 continue
@@ -298,6 +296,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         split = options.pop("split_dedup", False)
         if type(split) is not bool:
             raise ValueError("KVCR split_dedup must be a boolean")
+        shard = options.pop("shard_replicated", False)
+        if type(shard) is not bool:
+            raise ValueError("KVCR shard_replicated must be a boolean")
+        if shard and not split:
+            raise ValueError("KVCR shard_replicated requires split_dedup")
         self._layers_per_delivery = options.pop("layers_per_delivery", 1)
         self._max_deliveries = options.pop("max_deliveries", 4)
         for name, value in (
@@ -352,6 +355,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 self._broadcaster = LinkerMLADedupBroadcaster.build(
                     self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
                 )
+        # Replicated pages stored once across the TP group: each rank keeps the
+        # pages it owns, so the group holds one copy instead of tp copies.
+        self._shard = shard and isinstance(self._broadcaster, _SplitLayerGather)
         self.layer_done_counter = LayerWiseLoadCounter(
             self.pool_group.num_layers,
             self._broadcast_loaded_layers if self._broadcaster is not None else None,
@@ -513,6 +519,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 in (("HIT", "DRAM"), ("FETCHABLE", "REMOTE_G2"))
                 for status, tier in result
             ]
+            if self._shard:
+                rank = self._broadcaster.rank
+                hits = [
+                    hit or self._page_owner(key) != rank
+                    for hit, key in zip(hits, encoded)
+                ]
             missing = [0]
             for hit in hits:
                 missing.append(missing[-1] + (not hit))
@@ -554,10 +566,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             t.name: [
                 self.layout.encode_key(key, t.name)
                 for key in keys[max(0, hit_pages - max(1, len(t.keys))) : hit_pages]
+                if not self._shard or self._page_owner(key) == self._broadcaster.rank
             ]
             for t in prepared
             if t.hit_policy != PoolHitPolicy.ALL_PAGES
         }
+        windows = {name: window for name, window in windows.items() if window}
         if not windows:
             return True
         if scope is None:
@@ -596,7 +610,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             resolved = self.layout.group.resolve_transfers(
                 transfers, allow_partial=True, allow_missing_kv=True
             )
-            plan = tuple((str(t.name), tuple(t.keys)) for t in resolved)
+            plan = tuple((PoolName(t.name).value, tuple(t.keys)) for t in resolved)
             slots = {t.name: t.host_indices for t in resolved}
         return self._call(self._load, rid, prepared, plan, slots)
 
@@ -655,7 +669,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         slots.setdefault(name, []).append(indices)
                 merged = {name: torch.cat(parts) for name, parts in slots.items()}
                 if isinstance(self._broadcaster, _SplitLayerGather):
-                    broadcast = self._broadcaster.prepare(merged)
+                    owners = {}
+                    for load in queued:
+                        for name, page_keys in load.plan:
+                            owners.setdefault(name, []).extend(
+                                self._page_owner(key) for key in page_keys
+                            )
+                    broadcast = self._broadcaster.prepare(
+                        merged, {PoolName(name): o for name, o in owners.items()}
+                    )
                 else:
                     broadcast = self._broadcaster.prepare_broadcast(
                         merged, torch.cuda.current_stream()
@@ -696,20 +718,23 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._batches.append(batch)
         return index
 
+    def _page_owner(self, key):
+        """Owning TP rank of a storage key: every pool of a page shares one owner."""
+        decoded = self.layout.decode_key(key) if isinstance(key, bytes) else None
+        page_hash = decoded[1] if decoded is not None else key
+        return int(page_hash[:16], 16) % self._broadcaster.size
+
     def _owned(self, loads):
-        """Loads restricted to this rank's round-robin share of each pool's pages."""
+        """Loads restricted to the pages this rank owns."""
         gather = self._broadcaster
-        offsets = Counter()
         owned = []
         for load in loads:
             transfers = []
             for transfer in load.transfers:
-                start = offsets[transfer.name]
-                offsets[transfer.name] += len(transfer.keys)
                 picks = [
                     i
-                    for i in range(len(transfer.keys))
-                    if gather.owner(start + i) == gather.rank
+                    for i, key in enumerate(transfer.keys)
+                    if self._page_owner(key) == gather.rank
                 ]
                 if picks:
                     transfers.append(
@@ -817,6 +842,23 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def _prepare_offload(self, transfers):
         prepared = self.layout.prepare(list(transfers), allow_partial=True)
+        if self._shard:
+            rank = self._broadcaster.rank
+            prepared = tuple(
+                replace(
+                    t,
+                    keys=tuple(t.keys[i] for i in picks),
+                    locations=tuple(t.locations[i] for i in picks),
+                )
+                for t in prepared
+                if (
+                    picks := [
+                        i
+                        for i, key in enumerate(t.keys)
+                        if self._page_owner(key) == rank
+                    ]
+                )
+            )
         return self.layout.mappings(prepared)
 
     def _fail_batch(self, batch, error):
