@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
@@ -154,6 +155,7 @@ class TestKVCRDirectLinker(CustomTestCase):
             page_size=1,
         )
         self.runtime = Runtime()
+        self.hint = KvHintsEnvelope(protocol_version="0.1", message_id="test")
         module = "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker"
         self.patches = [
             patch.dict(
@@ -400,21 +402,18 @@ class TestKVCRDirectLinker(CustomTestCase):
 
     def test_hint_scope_cleanup_waits_for_accepted_load(self):
         a, b = CacheRequestHandle("a", 1), CacheRequestHandle("b", 2)
-        hints = {"actions": [{"source": ["a"]}]}
-        self.linker.set_request_context(a, hints)
+        self.linker.set_request_context(a, self.hint)
         scope = next(iter(self.client.hints))
-        hints["actions"][0]["source"].append("changed")
-        self.assertEqual(self.client.hints[scope], {"actions": [{"source": ["a"]}]})
-        self.linker.set_request_context(b, {"actions": [{"source": "b"}]})
+        self.linker.set_request_context(b, self.hint)
         self.assertEqual(len(self.client.hints), 2)
         self.linker.load("a", self.transfer(["a"]))
         self.linker.release_request_context(a)
         next_attempt = CacheRequestHandle("a", 2)
-        self.linker.set_request_context(next_attempt, {"actions": [{"source": "new"}]})
+        self.linker.set_request_context(next_attempt, self.hint)
         self.linker.release_request_context(b)
         self.assertEqual(len(self.client.hints), 2)
         self.linker.release_request_context(next_attempt)
-        self.assertEqual(self.client.hints, {scope: {"actions": [{"source": ["a"]}]}})
+        self.assertEqual(self.client.hints, {scope: self.hint})
         self.linker.start_layer_wise_loading()
         eventually(lambda: len(self.client.calls) == 3)
         self.assertEqual({call[3] for call in self.client.calls}, {scope})
@@ -518,7 +517,7 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.addCleanup(self.linker.close)
         self.client = self.runtime.client
         self.assertTrue(self.linker.requires_lookup_confirmation)
-        self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
+        self.linker.set_request_context(CacheRequestHandle("a", 0), self.hint)
         return [
             PoolTransfer(PoolName.KV, keys=["a", "b", "c"]),
             PoolTransfer(
@@ -586,7 +585,7 @@ class TestKVCRDirectLinker(CustomTestCase):
         with patch.object(self.linker, "_make_runtime", return_value=Runtime()):
             self.linker.reset()
         self.assertTrue(self.runtime.closed)
-        self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
+        self.linker.set_request_context(CacheRequestHandle("a", 0), self.hint)
         self.assertFalse(self.linker.confirm_lookup("a", transfers, 3))
 
     def test_failure_stops_unsubmitted_work_and_fails_dependent_offload(self):
@@ -630,7 +629,7 @@ class TestKVCRDirectLinker(CustomTestCase):
 
     def test_request_cleanup_after_close_and_shutdown_rejects_waiting_commands(self):
         handle = CacheRequestHandle("a", 0)
-        self.linker.set_request_context(handle, {"actions": []})
+        self.linker.set_request_context(handle, self.hint)
         entered, release = threading.Event(), threading.Event()
         original_close = self.runtime.close
 
@@ -751,26 +750,40 @@ class TestKVCRDirectLinker(CustomTestCase):
             options = {"replicated_source_rank_routing": True} if enabled else {}
             with self.subTest(options=options, endpoint=endpoint):
                 linker, client = self.ranked_linker(options)
-                hint = {
-                    "actions": [
-                        {
-                            "action_type": action,
-                            "payload": {"source_control_endpoint": endpoint},
-                        }
+                hint = KvHintsEnvelope(
+                    protocol_version="0.1",
+                    message_id="routing",
+                    actions=[
+                        KvHintAction(
+                            action_id=action,
+                            action_type=action,
+                            action_version="0.1",
+                            payload={
+                                "source_control_endpoint": endpoint,
+                                "block_hashes": [1, 2],
+                            },
+                        )
                         for action in ("kv.other", "kv.fetch")
-                    ]
-                }
+                    ],
+                )
                 linker.set_request_context(CacheRequestHandle("a", 0), hint)
                 sent = next(iter(client.hints.values()))
+                self.assertIs(sent.actions[0], hint.actions[0])
+                self.assertIs(
+                    sent.actions[1].payload["block_hashes"],
+                    hint.actions[1].payload["block_hashes"],
+                )
+                if endpoint == expected:
+                    self.assertIs(sent, hint)
                 self.assertEqual(
                     [
-                        action["payload"]["source_control_endpoint"]
-                        for action in sent["actions"]
+                        action.payload["source_control_endpoint"]
+                        for action in sent.actions
                     ],
                     [endpoint, expected],
                 )
                 self.assertEqual(
-                    hint["actions"][1]["payload"]["source_control_endpoint"], endpoint
+                    hint.actions[1].payload["source_control_endpoint"], endpoint
                 )
                 linker.close()
 
@@ -805,22 +818,15 @@ class TestKVCRDirectLinker(CustomTestCase):
             runtime_factory=lambda *args, **kwargs: runtime,
         )
         self.addCleanup(linker.close)
-        linker.set_request_context(
-            CacheRequestHandle("a", 0), {"actions": [{"action_type": "kv.fetch"}]}
-        )
+        linker.set_request_context(CacheRequestHandle("a", 0), self.hint)
         self.assertEqual(runtime.client.hints, {})
         self.assert_local_hit(linker, runtime.client)
 
     def test_unrelated_hint_actions_preserve_local_lookup(self):
-        from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
-
-        hint = decode_kv_hints_envelope(
-            {"protocol_version": "0.1", "message_id": "other", "actions": []}
-        )
         with patch.object(
             self.client, "submit_hint", side_effect=ValueError("no kv.fetch action")
         ):
-            self.linker.set_request_context(CacheRequestHandle("a", 0), hint)
+            self.linker.set_request_context(CacheRequestHandle("a", 0), self.hint)
         self.assert_local_hit(self.linker, self.client)
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import logging
@@ -224,19 +223,22 @@ class _SplitLayerGather:
 
 def _offset_source_ports(hints, offset):
     """Offset the first fetch action in an explicitly homogeneous deployment."""
-    for action in hints.get("actions", ()):
-        if not isinstance(action, dict) or action.get("action_type") != "kv.fetch":
+    for index, action in enumerate(hints.actions):
+        if action.action_type != "kv.fetch":
             continue
-        payload = action.get("payload")
+        payload = action.payload
         if isinstance(payload, dict):
             endpoint = payload.get("source_control_endpoint")
             address = (
                 parse_advertisable_tcp(endpoint) if isinstance(endpoint, str) else None
             )
             if address is not None and address[1] + offset <= 65535:
-                payload["source_control_endpoint"] = (
-                    f"tcp://{address[0]}:{address[1] + offset}"
+                endpoint = f"tcp://{address[0]}:{address[1] + offset}"
+                actions = hints.actions.copy()
+                actions[index] = msgspec.structs.replace(
+                    action, payload=payload | {"source_control_endpoint": endpoint}
                 )
+                return msgspec.structs.replace(hints, actions=actions)
         break
     return hints
 
@@ -454,12 +456,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             future.set_exception(RuntimeError("KVCR linker is closed"))
 
     def set_request_context(self, handle, kv_hints):
-        hints = (
-            msgspec.to_builtins(kv_hints)
-            if isinstance(kv_hints, msgspec.Struct)
-            else copy.deepcopy(kv_hints)
-        )
-        self._call(self._set_context, handle, hints)
+        self._call(self._set_context, handle, kv_hints)
 
     def _set_context(self, handle, hints):
         scope = f"{len(handle.rid)}:{handle.rid}:{handle.attempt_id}"
