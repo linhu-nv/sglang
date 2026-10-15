@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import socket
@@ -37,8 +38,9 @@ logger = logging.getLogger(__name__)
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, on_layer_ready=None):
         self.num_layers = num_layers
+        self.on_layer_ready = on_layer_ready
         self.reset()
 
     def update_producer(self) -> int:
@@ -66,6 +68,8 @@ class LayerWiseLoadCounter:
             return
         try:
             futures[threshold].result()
+            if self.on_layer_ready is not None:
+                self.on_layer_ready(index, threshold)
         except BaseException as error:
             raise RuntimeError("KVCR layer-wise load failed") from error
         finally:
@@ -84,6 +88,9 @@ class _Load:
     scope: str | None
     transfers: tuple
     claims: list = field(default_factory=list)
+    # Rank-0 loading: the plan compared across ranks, and device slots per pool.
+    plan: tuple = ()
+    slots: dict = field(default_factory=dict)
     done: bool = False
     error: BaseException | None = None
 
@@ -99,6 +106,9 @@ class _Batch:
     exhausted: bool = False
     error: BaseException | None = None
     started: float = field(default_factory=time.perf_counter)
+    # Rank-0 loading: recorded after this batch's last broadcast.
+    broadcast_done: object = None
+    broadcast_pending: bool = False
 
 
 @dataclass
@@ -124,8 +134,95 @@ class _Confirm:
 class _Operation:
     owner: _Batch | _Offload | _Confirm
     keys: set[bytes]
-    layer: int | None = None
+    layers: tuple[int, ...] = ()
     result: object = None
+
+
+class _SplitLayerGather:
+    """Each rank reads 1/tp of a load's pages; every layer is all-gathered.
+
+    Rank-replicated pools only. Pages are dealt round-robin over the TP group
+    in the logical load order, which all ranks share; each rank reads its share
+    through KVCR, then per layer packs its rows, all-gathers the packed chunks
+    over NCCL and scatters the other ranks' rows into place.
+    """
+
+    def __init__(self, pool_group, group):
+        self.group = group
+        self.rank = torch.distributed.get_rank(group)
+        self.size = torch.distributed.get_world_size(group)
+        self.pools = pool_group.entry_map
+        self.buffers = {
+            name: [
+                [buf.view(torch.uint8).view(buf.shape[0], -1) for buf in component]
+                for component in pool.components
+            ]
+            for name, pool in self.pools.items()
+        }
+        for name, pool in self.pools.items():
+            if pool._row_span != 1:
+                raise ValueError(f"Split loading needs one row per page: {name}")
+        first = next(iter(self.buffers.values()))[0][0]
+        self.device = first.device
+        self.staging = torch.empty(0, dtype=torch.uint8, device=self.device)
+        self.gathered = torch.empty(0, dtype=torch.uint8, device=self.device)
+        # Warm the communicator before serving.
+        probe = torch.zeros(self.size, dtype=torch.uint8, device=self.device)
+        torch.distributed.all_gather_into_tensor(probe, probe[self.rank : self.rank + 1], group=group)
+
+    def owner(self, page):
+        return page % self.size
+
+    def prepare(self, indices_by_pool):
+        """Rows per pool, split by owner rank and padded to equal length."""
+        prepared = {}
+        for name, indices in indices_by_pool.items():
+            rows = torch.as_tensor(
+                self.pools[name].prepare_locations(indices),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            per_rank = [rows[r :: self.size] for r in range(self.size)]
+            width = max(part.numel() for part in per_rank)
+            if width == 0:
+                continue
+            counts = [part.numel() for part in per_rank]
+            padded = torch.stack(
+                [
+                    torch.cat([part, part.new_full((width - part.numel(),), part[0] if part.numel() else 0)])
+                    for part in per_rank
+                ]
+            )
+            prepared[name] = (padded, counts, width)
+        return prepared
+
+    def gather_layer(self, layer_id, prepared):
+        for name, (padded, counts, width) in prepared.items():
+            pool = self.pools[name]
+            layer = pool.layer_mapping.get(layer_id)
+            if layer is None:
+                continue
+            for buffers in self.buffers[name]:
+                for index in (layer,) if isinstance(layer, int) else layer:
+                    self._gather(buffers[index], padded, counts, width)
+
+    def _gather(self, buf, padded, counts, width):
+        row_bytes = buf.shape[1]
+        need = width * row_bytes
+        if self.staging.numel() < need:
+            self.staging = torch.empty(need, dtype=torch.uint8, device=self.device)
+        if self.gathered.numel() < need * self.size:
+            self.gathered = torch.empty(
+                need * self.size, dtype=torch.uint8, device=self.device
+            )
+        mine = self.staging[:need].view(width, row_bytes)
+        torch.index_select(buf, 0, padded[self.rank], out=mine)
+        out = self.gathered[: need * self.size]
+        torch.distributed.all_gather_into_tensor(out, self.staging[:need], group=self.group)
+        out = out.view(self.size, width, row_bytes)
+        for r in range(self.size):
+            if r != self.rank and counts[r]:
+                buf.index_copy_(0, padded[r, : counts[r]], out[r, : counts[r]])
 
 
 def _offset_source_ports(hints, offset):
@@ -153,8 +250,6 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     local_storage_ownership = "kvcr"
 
     def __init__(self, server_args, params, *, components, runtime_factory=None):
-        if get_memory().enable_linker_mla_dedup:
-            raise ValueError("KVCR does not support --enable-linker-mla-dedup")
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=params.token_to_kv_pool_allocator.get_kvcache(),
             page_size=params.page_size,
@@ -199,6 +294,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         options, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
+        options = dict(options)
+        split = options.pop("split_dedup", False)
+        if type(split) is not bool:
+            raise ValueError("KVCR split_dedup must be a boolean")
+        self._layers_per_delivery = options.pop("layers_per_delivery", 1)
+        self._max_deliveries = options.pop("max_deliveries", 4)
+        for name, value in (
+            ("layers_per_delivery", self._layers_per_delivery),
+            ("max_deliveries", self._max_deliveries),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"KVCR {name} must be a positive integer")
         route_replicated = options.pop("replicated_source_rank_routing", False)
         if type(route_replicated) is not bool:
             raise ValueError("KVCR replicated_source_rank_routing must be a boolean")
@@ -216,7 +323,39 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._make_runtime = lambda: (runtime_factory or KVCRRuntime)(
             self.layout, options, rank=rank
         )
-        self.layer_done_counter = LayerWiseLoadCounter(self.pool_group.num_layers)
+        # Rank-replicated pools hold the same bytes on every TP rank: with
+        # --enable-linker-mla-dedup only rank 0 reads them and broadcasts each
+        # layer over the TP group, as the Mooncake linker does.
+        self._broadcaster = None
+        self._tp_group = params.attn_tp_cache_group or params.tp_cache_group
+        self._broadcast_loads = {}
+        if get_memory().enable_linker_mla_dedup:
+            if not self.pool_group.rank_replicated:
+                raise ValueError(
+                    "--enable-linker-mla-dedup requires rank-replicated pools"
+                )
+            if tp_size > 1 and split:
+                from sglang.srt.distributed.parallel_state import (
+                    create_custom_parallel_group,
+                )
+
+                ranks = torch.distributed.get_process_group_ranks(self._tp_group)
+                self._broadcaster = _SplitLayerGather(
+                    self.pool_group,
+                    create_custom_parallel_group(group_ranks=list(ranks), backend="nccl"),
+                )
+            elif tp_size > 1:
+                from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
+                    LinkerMLADedupBroadcaster,
+                )
+
+                self._broadcaster = LinkerMLADedupBroadcaster.build(
+                    self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
+                )
+        self.layer_done_counter = LayerWiseLoadCounter(
+            self.pool_group.num_layers,
+            self._broadcast_loaded_layers if self._broadcaster is not None else None,
+        )
         self._commands = Queue()
         self._command_lock = threading.Lock()
         self._completed_loads = Queue()
@@ -471,9 +610,16 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         prepared = self.layout.prepare(
             transfers, allow_partial=True, allow_missing_kv=True
         )
-        return self._call(self._load, rid, prepared)
+        plan, slots = (), {}
+        if self._broadcaster is not None:
+            resolved = self.layout.group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
+            )
+            plan = tuple((str(t.name), tuple(t.keys)) for t in resolved)
+            slots = {t.name: t.host_indices for t in resolved}
+        return self._call(self._load, rid, prepared, plan, slots)
 
-    def _load(self, rid, prepared):
+    def _load(self, rid, prepared, plan=(), slots=None):
         scope = self._request_scopes.get(rid)
         if not prepared:
             self._discard_lookup(scope)
@@ -486,6 +632,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             scope,
             prepared,
             [claim for claim in claims.values() if claim is not None],
+            plan,
+            slots or {},
         )
         self._loads[rid] = load
         self._queued.append(load)
@@ -507,36 +655,144 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             raise RuntimeError("KVCR linker is closed")
         self._raise_if_failed()
         # Synchronous load/start/reset calls keep this queue visible to the scheduler.
+        broadcast = None
+        if self._broadcaster is not None:
+            # Ranks may adopt different slots but must load the same pages in the
+            # same order; compare before deciding collectively to broadcast.
+            # Empty batches take part too, so every rank enters the gather.
+            queued = tuple(self._queued)
+            digest = hashlib.sha256(
+                repr([(load.rid, load.plan) for load in queued]).encode()
+            ).digest()
+            digests = [None] * torch.distributed.get_world_size(self._tp_group)
+            torch.distributed.all_gather_object(digests, digest, group=self._tp_group)
+            if all(other == digest for other in digests) and queued:
+                slots = {}
+                for load in queued:
+                    for name, indices in load.slots.items():
+                        slots.setdefault(name, []).append(indices)
+                merged = {name: torch.cat(parts) for name, parts in slots.items()}
+                if isinstance(self._broadcaster, _SplitLayerGather):
+                    broadcast = self._broadcaster.prepare(merged)
+                else:
+                    broadcast = self._broadcaster.prepare_broadcast(
+                        merged, torch.cuda.current_stream()
+                    )
+            elif queued:
+                logger.warning("KVCR load plans differ across ranks; all ranks read")
         if not self._queued:
             return -1
         self._freeze_gc_once()
         ready = torch.cuda.Event()
         ready.record()
-        return self._call(self._start, ready)
+        index = self._call(self._start, ready, broadcast is not None)
+        if broadcast is not None:
+            self._broadcast_loads[index] = [0, broadcast, ready]
+        return index
 
-    def _start(self, ready):
+    def _start(self, ready, broadcast=False):
         if not self._queued:
             return -1
         loads, self._queued = tuple(self._queued), []
         index = self.layer_done_counter.update_producer()
-        self._batches.append(
-            _Batch(
-                index,
-                loads,
-                ready,
-                self._layer_work(loads),
-                [1] * self.pool_group.num_layers,
-            )
+        split = broadcast and isinstance(self._broadcaster, _SplitLayerGather)
+        reader = not broadcast or split or self._broadcaster.is_src
+        batch = _Batch(
+            index,
+            loads,
+            ready,
+            (self._layer_work(self._owned(loads) if split else loads) if reader else iter(())),
+            [1] * self.pool_group.num_layers,
+            broadcast_pending=broadcast,
         )
+        if not reader:
+            # Bytes arrive by broadcast on the forward stream; layers are ready
+            # for the wait hook immediately and it launches the receives.
+            for layer in range(self.pool_group.num_layers):
+                batch.remaining[layer] = 0
+                self.layer_done_counter.complete(index, layer)
+        self._batches.append(batch)
         return index
 
+    def _owned(self, loads):
+        """Loads restricted to this rank's round-robin share of each pool's pages."""
+        gather = self._broadcaster
+        offsets = Counter()
+        owned = []
+        for load in loads:
+            transfers = []
+            for transfer in load.transfers:
+                start = offsets[transfer.name]
+                offsets[transfer.name] += len(transfer.keys)
+                picks = [
+                    i
+                    for i in range(len(transfer.keys))
+                    if gather.owner(start + i) == gather.rank
+                ]
+                if picks:
+                    transfers.append(
+                        replace(
+                            transfer,
+                            keys=tuple(transfer.keys[i] for i in picks),
+                            locations=tuple(transfer.locations[i] for i in picks),
+                        )
+                    )
+            owned.append(replace(load, transfers=tuple(transfers)))
+        return owned
+
+    def _broadcast_loaded_layers(self, index, threshold):
+        state = self._broadcast_loads.get(index)
+        if state is None:
+            return
+        first, prepared, ready = state
+        stream = torch.cuda.current_stream()
+        if first == 0:
+            stream.wait_event(ready)
+        # A layer may be waited on more than once or skipped: launch each
+        # broadcast once, in order, on the forward stream.
+        for layer in range(first, threshold + 1):
+            if isinstance(self._broadcaster, _SplitLayerGather):
+                self._broadcaster.gather_layer(layer, prepared)
+            else:
+                self._broadcaster.broadcast_loaded_layer(layer, prepared)
+        if threshold == self.pool_group.num_layers - 1:
+            done = torch.cuda.Event()
+            done.record()
+            del self._broadcast_loads[index]
+            self._send(self._finish_broadcast, index, done)
+        else:
+            state[0] = max(first, threshold + 1)
+
+    def _finish_broadcast(self, index, done):
+        for batch in self._batches:
+            if batch.index == index:
+                batch.broadcast_done = done
+                return
+
     def _layer_work(self, loads):
-        for layer in range(self.pool_group.num_layers):
+        # Each deliver carries a group of consecutive layers: every deliver is
+        # a control round trip and a source-side request, so fewer, larger ones
+        # move the same bytes with less fixed cost. A layer is ready once its
+        # group lands.
+        num_layers = self.pool_group.num_layers
+        group = self._layers_per_delivery
+        for start in range(0, num_layers, group):
+            layers = tuple(range(start, min(num_layers, start + group)))
             for load in loads:
-                for blocks in self.layout.mappings(load.transfers, layer):
-                    yield layer, load.scope, blocks
-            # The sentinel accounts for work not yet submitted in this layer.
-            yield layer, None, None
+                merged = []
+                for layer in layers:
+                    for index, blocks in enumerate(
+                        self.layout.mappings(load.transfers, layer)
+                    ):
+                        if index == len(merged):
+                            merged.append({})
+                        for key, refs in blocks.items():
+                            merged[index].setdefault(key, []).extend(refs)
+                for blocks in merged:
+                    yield layers, load.scope, blocks
+            # Sentinels account for work not yet submitted in these layers.
+            for layer in layers:
+                yield (layer,), None, None
 
     def offload(self, transfers):
         # Row conversion copies indices to CPU and waits for queued GPU work.
@@ -616,8 +872,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             owner = operation.owner
             owner.active -= 1
             if isinstance(owner, _Batch):
-                owner.remaining[operation.layer] -= 1
-                self._complete_layer(owner, operation.layer)
+                for layer in operation.layers:
+                    owner.remaining[layer] -= 1
+                    self._complete_layer(owner, layer)
             elif isinstance(owner, _Confirm):
                 owner.claims.update(dict.fromkeys(operation.keys))
                 owner.claims.update(
@@ -632,32 +889,43 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         for batch in self._batches:
             if not batch.ready.query():
                 continue
-            while not batch.exhausted and deliveries < 4:
+            while not batch.exhausted and deliveries < self._max_deliveries:
                 try:
-                    layer, scope, blocks = next(batch.work)
+                    layers, scope, blocks = next(batch.work)
                 except StopIteration:
                     batch.exhausted = True
                     break
                 if blocks is None:
-                    batch.remaining[layer] -= 1
-                    self._complete_layer(batch, layer)
+                    batch.remaining[layers[0]] -= 1
+                    self._complete_layer(batch, layers[0])
                     continue
                 started = time.perf_counter()
                 handle = self._runtime.client.deliver(blocks, request_id=scope)
                 logger.debug(
-                    "KVCR submission batch=%d layer=%d keys=%d cpu_ms=%.3f",
+                    "KVCR submission batch=%d layers=%s keys=%d cpu_ms=%.3f",
                     batch.index,
-                    layer,
+                    layers,
                     len(blocks),
                     (time.perf_counter() - started) * 1000,
                 )
-                self._operations[handle] = _Operation(batch, set(blocks), layer)
+                self._operations[handle] = _Operation(batch, set(blocks), layers)
                 batch.active += 1
-                batch.remaining[layer] += 1
+                for layer in layers:
+                    batch.remaining[layer] += 1
                 deliveries += 1
         # Completion queues preserve admission order even if transport does not.
         while (
-            self._batches and self._batches[0].exhausted and not self._batches[0].active
+            self._batches
+            and self._batches[0].exhausted
+            and not self._batches[0].active
+            and (
+                not self._batches[0].broadcast_pending
+                or self._batches[0].error is not None
+                or (
+                    self._batches[0].broadcast_done is not None
+                    and self._batches[0].broadcast_done.query()
+                )
+            )
         ):
             batch = self._batches.popleft()
             logger.debug(
@@ -752,6 +1020,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def reset(self):
         self._call(self._reset)
+        self._broadcast_loads.clear()
 
     def _reset(self):
         self._preparer.shutdown(wait=True, cancel_futures=True)
