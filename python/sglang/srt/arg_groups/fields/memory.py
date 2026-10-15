@@ -216,7 +216,7 @@ class Memory(msgspec.Struct):
     ] = "mooncake"
     enable_linker_mla_dedup: A[
         bool,
-        "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
+        "Load replicated MLA KV on rank 0 and broadcast each layer (Mooncake or KVCR linker).",
     ] = False
 
     # -------------------------------------------------------------------------
