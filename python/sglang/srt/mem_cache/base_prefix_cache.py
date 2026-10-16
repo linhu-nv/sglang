@@ -644,6 +644,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> Optional[tuple[int, int]]:
         """Expected storage-hit span in logical tokens for a waiting request."""
         return None
+    def has_uncommitted_restore(self, req: Any) -> bool:
+        """Whether a restore still owns device slots outside the cache.
+
+        Such a request must not be rematched from the waiting queue: the
+        rematch rewrites ``req.prefix_len``, which alone cannot identify
+        those slots until the normal cache path commits them. Caches that only
+        hand out slots they already own have nothing to report.
+        """
+        return False
 
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle
