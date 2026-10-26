@@ -628,8 +628,15 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
     def rotation_base_of(self, node):
         return self._inner_cache.rotation_base_of(node)
 
-    def evict_for_alloc(self, params: EvictParams):
-        return self._inner_cache.evict_for_alloc(params)
+    def evict_for_alloc(
+        self, params: EvictParams, *, allocation_reclaim_satisfied=None
+    ):
+        if allocation_reclaim_satisfied is None:
+            return self._inner_cache.evict_for_alloc(params)
+        # Joint-reclaim callers (unified SWA allocators) pass a stop predicate.
+        return self._inner_cache.evict_for_alloc(
+            params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
+        )
 
     def swa_retain_floor(self, req):
         return self._inner_cache.swa_retain_floor(req)

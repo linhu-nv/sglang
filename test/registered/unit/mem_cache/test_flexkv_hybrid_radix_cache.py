@@ -151,6 +151,20 @@ def test_unified_node_and_allocator_protocols_delegate_to_inner_cache(method, ar
     cache.flexkv_connector.check_completed_stores.assert_not_called()
 
 
+def test_evict_for_alloc_forwards_joint_reclaim_predicate():
+    inner = MagicMock()
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = inner
+    params = object()
+    satisfied = MagicMock(return_value=True)
+
+    cache.evict_for_alloc(params, allocation_reclaim_satisfied=satisfied)
+
+    inner.evict_for_alloc.assert_called_once_with(
+        params, allocation_reclaim_satisfied=satisfied
+    )
+
+
 def test_evict_does_not_poll_cross_rank_store_completion():
     inner = MagicMock()
     inner.is_root.return_value = False
