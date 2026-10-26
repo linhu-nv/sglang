@@ -21,7 +21,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 def _component_with_mapping(mapping: torch.Tensor):
     allocator = MagicMock()
     allocator.page_size = 1
-    allocator.translate_loc_from_full_to_swa.return_value = mapping
+    allocator.translate_swa_indices_for_transfer.return_value = mapping
 
     component = object.__new__(SWAComponent)
     component.cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
@@ -54,6 +54,7 @@ def test_swa_evict_reports_only_live_physical_slots():
         node,
         device_frees=device_frees,
         host_frees=defaultdict(list),
+        cache_actions=[],
         target=EvictLayer.DEVICE,
     )
 
@@ -66,7 +67,7 @@ def test_swa_evict_reports_only_live_physical_slots():
         device_frees[ComponentType.SWA][0],
         torch.tensor([13, 14], dtype=torch.int64),
     )
-    allocator.translate_loc_from_full_to_swa.assert_called_once_with(full_value)
+    allocator.translate_swa_indices_for_transfer.assert_called_once_with(full_value)
 
 
 def test_internal_ghost_tombstone_reports_structural_progress():
@@ -75,7 +76,7 @@ def test_internal_ghost_tombstone_reports_structural_progress():
     core.component_evictable_size_ = {ComponentType.SWA: 2}
     component = MagicMock()
 
-    def tombstone_internal(_tracker, _device_frees, _host_frees):
+    def tombstone_internal(_tracker, _device_frees, _host_frees, **_kwargs):
         core.component_evictable_size_[ComponentType.SWA] = 0
         return None
 
@@ -114,6 +115,7 @@ def test_swa_evict_does_not_claim_tombstoned_slots():
         node,
         device_frees=defaultdict(list),
         host_frees=defaultdict(list),
+        cache_actions=[],
         target=EvictLayer.DEVICE,
     )
 
