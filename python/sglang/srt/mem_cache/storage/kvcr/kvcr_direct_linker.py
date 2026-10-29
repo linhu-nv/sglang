@@ -535,16 +535,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         windows = {
             t.name: [
                 self.layout.encode_key(key, t.name)
-                for key in keys[
-                    (
-                        0
-                        if t.hit_policy == PoolHitPolicy.ALL_PAGES
-                        else max(0, hit_pages - max(1, len(t.keys)))
-                    ) : hit_pages
-                ]
+                for key in keys[max(0, hit_pages - max(1, len(t.keys))) : hit_pages]
                 if not self._shard or self._page_owner(key) == self._gather.rank
             ]
             for t in prepared
+            if t.hit_policy != PoolHitPolicy.ALL_PAGES
         }
         windows = {name: window for name, window in windows.items() if window}
         if not windows:
