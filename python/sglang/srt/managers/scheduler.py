@@ -4349,6 +4349,10 @@ class Scheduler(
                 self._add_request_to_queue(req)
             return None, running_batch
 
+        launch_pending_loads = getattr(self.tree_cache, "launch_pending_loads", None)
+        if launch_pending_loads is not None:
+            launch_pending_loads(can_run_list)
+
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries
         if self.enable_hicache_storage and retries is not None:
