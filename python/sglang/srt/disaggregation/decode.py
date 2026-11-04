@@ -3452,7 +3452,11 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
-        if self.enable_decode_hicache:
+        if self.enable_decode_hicache or self.enable_flexkv:
+            # FlexKV: drain completed stores (releasing the radix locks they
+            # held) and launch queued ones; the decode loop never reaches
+            # get_next_batch_to_run, where the other loops do this. Every TP
+            # rank calls it, so its cross-rank scatter stays symmetric.
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

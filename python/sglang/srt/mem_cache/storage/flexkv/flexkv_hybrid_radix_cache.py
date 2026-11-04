@@ -7,6 +7,7 @@ import os
 import threading
 from array import array
 from contextlib import nullcontext
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -99,6 +100,22 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         self.page_size = inner_cache.page_size
         self.disable = inner_cache.disable
         self.device = inner_cache.device
+        # PD decode: the prompt KV arrives over the disaggregation transfer and
+        # the decode scheduler has no path that restores a FlexKV host hit, so
+        # matches report device hits only (a host hit promised to prefill
+        # would never be filled). Stores still run -- the prompt at prebuilt,
+        # the full sequence at finish -- so a later prefill on any node can
+        # reuse this node's KV through FlexKV.
+        self._pd_decode = (
+            getattr(server_args, "disaggregation_mode", "null") == "decode"
+        )
+        # DeepSeek-V4: its compressed KV (c4/c128/indexer) moves per request and
+        # is not in the tree, so a decode-side device match could make prefill
+        # skip tokens whose compressed KV never arrives. Every decode-side
+        # match is the empty prefix; the tree only anchors FlexKV stores.
+        self._pd_decode_store_only = self._pd_decode and bool(
+            getattr(model_config, "is_deepseek_v4_arch", False)
+        )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(
@@ -221,8 +238,11 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         if params.req is not None:
             # A rematch supersedes the previous lookup even if it misses.
             self._release_load_marker(params.req.cache_request_handle)
+        if self.__dict__.get("_pd_decode_store_only", False):
+            params = dataclasses.replace(params, key=params.key[:0])
+            return self._inner_cache.match_prefix(params)
         result = self._inner_cache.match_prefix(params)
-        if self.disable or params.req is None:
+        if self.disable or params.req is None or self.__dict__.get("_pd_decode", False):
             return result
 
         key = params.key.page_aligned(self.page_size)

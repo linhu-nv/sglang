@@ -125,6 +125,12 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
     ) -> None:
         super().__init__(params)
 
+        # PD decode: no restore path on the decode scheduler, so only the
+        # device tree is matched (see FlexKVHybridRadixCache). Stores still run.
+        self._pd_decode = (
+            getattr(server_args, "disaggregation_mode", "null") == "decode"
+        )
+
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         # ``tp_group`` and ``attn_tp_group`` are sometimes passed
         # interchangeably by sglang's factory; prefer the explicit
@@ -256,7 +262,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         if params.req is not None:
             # A rematch supersedes the previous lookup even if it misses.
             self._release_load_marker(params.req.cache_request_handle)
-        if self.disable or not key:
+        if self.disable or not key or self.__dict__.get("_pd_decode", False):
             return super().match_prefix(params)
         if params.req is not None and self.has_uncommitted_restore(params.req):
             raise RuntimeError(

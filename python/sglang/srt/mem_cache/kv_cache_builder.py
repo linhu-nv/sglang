@@ -270,6 +270,7 @@ def validate_decode_radix_cache(
     token_to_kv_pool: object,
     is_hybrid_swa: bool,
     enable_hierarchical_cache: bool,
+    enable_flexkv: bool = False,
 ) -> None:
     """Reject decode-side radix cache on KV layouts its prefix reuse cannot serve.
 
@@ -290,7 +291,15 @@ def validate_decode_radix_cache(
     # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
     # SWA ring and c128 state are request-scoped and always transferred whole, so
     # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
+    if getattr(model_config, "is_deepseek_v4_arch", False) and enable_flexkv:
+        # FlexKV answers every decode-side match with the empty prefix on
+        # DeepSeek-V4 (FlexKVHybridRadixCache), so no page is reused here and
+        # prefill transfers the whole prompt; the tree only anchors stores.
+        logger.warning(
+            "DeepSeek-V4 decode server with FlexKV: the decode radix tree is "
+            "used for FlexKV stores only; decode-side prefix reuse is off."
+        )
+    elif getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
         token_to_kv_pool, "_unified_kv", False
     ):
         raise ValueError(
@@ -380,6 +389,7 @@ def build_kv_cache(
             token_to_kv_pool=token_to_kv_pool,
             is_hybrid_swa=is_hybrid_swa,
             enable_hierarchical_cache=enable_hierarchical_cache,
+            enable_flexkv=get_memory().enable_flexkv,
         )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
