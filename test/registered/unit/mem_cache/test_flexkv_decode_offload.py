@@ -111,22 +111,27 @@ def test_stride_rounds_to_pages_and_zero_is_off():
 def test_scheduler_hook_is_off_without_stride_or_with_spec():
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
+        flexkv_decode_offload_stride,
     )
 
-    plain = SimpleNamespace(spec_algorithm=SimpleNamespace(is_none=lambda: True))
-    spec = SimpleNamespace(spec_algorithm=SimpleNamespace(is_none=lambda: False))
-    for enable, stride, batch, want in (
+    plain = SimpleNamespace(is_none=lambda: True)
+    spec = SimpleNamespace(is_none=lambda: False)
+    for enable, stride, algo, want in (
         (False, 8, plain, 0),
         (True, 0, plain, 0),
         (True, 8, spec, 0),
         (True, 8, plain, 8),
     ):
-        proc = SimpleNamespace(
-            enable_flexkv=enable,
+        got = flexkv_decode_offload_stride(
             tree_cache=SimpleNamespace(decode_offload_stride=stride),
+            enable_flexkv=enable,
+            spec_algorithm=algo,
         )
-        got = SchedulerBatchResultProcessor._flexkv_decode_offload_stride(proc, batch)
         assert got == want
+    # The processor is a frozen dataclass: the stride must be a field set at
+    # construction, defaulting to off for callers that do not pass it.
+    field = SchedulerBatchResultProcessor.__dataclass_fields__["flexkv_decode_offload_stride"]
+    assert field.default == 0
 
 
 def test_stores_every_stride_page_aligned_from_the_request_row():

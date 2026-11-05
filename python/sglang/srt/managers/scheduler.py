@@ -227,6 +227,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+    flexkv_decode_offload_stride,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
@@ -2685,6 +2686,11 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            flexkv_decode_offload_stride=flexkv_decode_offload_stride(
+                tree_cache=self.tree_cache,
+                enable_flexkv=self.enable_flexkv,
+                spec_algorithm=self.spec_algorithm,
+            ),
         )
 
     def init_internal_state(self) -> None:
