@@ -130,6 +130,15 @@ def _record_token_values(
     values.extend(row if num_visible == len(row) else row[:num_visible])
 
 
+def flexkv_decode_offload_stride(
+    *, tree_cache: BasePrefixCache, enable_flexkv: bool, spec_algorithm
+) -> int:
+    """Off for speculative decoding, whose KV commit point is not the output length."""
+    if not enable_flexkv or not spec_algorithm.is_none():
+        return 0
+    return tree_cache.decode_offload_stride
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -157,6 +166,8 @@ class SchedulerBatchResultProcessor:
     # staging.
     prefill_launched_reqs: ReqList
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # FlexKV mid-decode store stride in tokens; 0 = off.
+    flexkv_decode_offload_stride: int = 0
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1534,15 +1545,6 @@ class SchedulerBatchResultProcessor:
             self.request_retirer.release(req, checkpoint=False)
         req.time_stats.set_completion_time()
 
-    def _flexkv_decode_offload_stride(self, batch: ScheduleBatch) -> int:
-        """FlexKV's mid-decode store stride (0 = off), resolved once. Off for
-        speculative decoding, whose KV commit point is not the output length."""
-        stride = self.__dict__.get("_flexkv_decode_stride")
-        if stride is None:
-            stride = self.tree_cache.decode_offload_stride if self.enable_flexkv else 0
-            self._flexkv_decode_stride = stride
-        return stride if stride and batch.spec_algorithm.is_none() else 0
-
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -1599,7 +1601,7 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if (
-            self._flexkv_decode_offload_stride(batch)
+            self.flexkv_decode_offload_stride
             and not req.finished()
             and not req.is_retracted
             and not req.skip_radix_cache_insert

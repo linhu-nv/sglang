@@ -258,6 +258,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+    flexkv_decode_offload_stride,
 )
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -3017,6 +3018,11 @@ class Scheduler(
             uocr_runtime=self.uocr_runtime,
             prefill_launched_reqs=self.prefill_launched_reqs,
             still_in_batch=self.still_in_batch,
+            flexkv_decode_offload_stride=flexkv_decode_offload_stride(
+                tree_cache=self.tree_cache,
+                enable_flexkv=self.enable_flexkv,
+                spec_algorithm=self.spec_algorithm,
+            ),
         )
 
     def init_internal_state(self) -> None:
