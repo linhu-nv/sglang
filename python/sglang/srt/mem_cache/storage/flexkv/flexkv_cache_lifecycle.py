@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from array import array
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     MatchPrefixParams,
@@ -62,6 +64,121 @@ class _RestoreLease:
 
 
 class FlexKVCacheLifecycleMixin:
+    # Mid-decode stores leave the SWA window out (see store_decode_progress).
+    _decode_store_full_only = False
+
+    def _init_decode_offload(self) -> None:
+        """``SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE``: also store a decoding
+        request's KV every N generated tokens (page-aligned, at least a page),
+        so the store at finish only writes the tail. 0 = store at finish only."""
+        stride = int(envs.SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE.get() or 0)
+        if stride > 0:
+            stride = max(self.page_size, stride // self.page_size * self.page_size)
+        self.decode_offload_stride = stride
+        # In-flight mid-decode stores: store rid -> the KV row it reads, and
+        # per row how many are in flight. A row is fenced before any of its
+        # slots can be freed (free_kv_row, checkpoint dedup).
+        self._decode_stores: dict[str, int] = {}
+        self._decode_store_rows: dict[int, int] = {}
+        self._decode_store_seq = 0
+
+    def store_decode_progress(self, req: Req) -> None:
+        """Store the page-aligned KV a decoding request has computed so far,
+        once ``decode_offload_stride`` new tokens accumulated since its last
+        store.
+
+        Reads the request's own KV row; nothing is inserted into the radix
+        tree and no slot changes owner, so the row stays the request's until
+        release_kv_cache. The store only reads it: the row is fenced (the store
+        must complete) before release can free any of its slots. Hybrid (SWA)
+        caches store Full KV only and hold the last page back, so the store at
+        finish always has a new block to carry the SWA window."""
+        stride = self.decode_offload_stride
+        # The last output token's KV is computed by the next forward.
+        committed = len(req.origin_input_ids) + len(req.output_ids) - 1
+        aligned = committed // self.page_size * self.page_size
+        if self._decode_store_full_only:
+            aligned -= self.page_size
+        stored = getattr(req, "_flexkv_decode_stored_len", 0)
+        if aligned - stored < stride or aligned <= 0:
+            return
+        namespace_kwargs = _namespace_kwargs(
+            self.flexkv_connector, req.extra_key, req.cache_salt
+        )
+        if namespace_kwargs is None or req.kv.req_pool_idx is None:
+            return
+        row = int(req.kv.req_pool_idx)
+        token_ids = (req.origin_input_ids + req.output_ids)[:aligned]
+        kv_indices = self.req_to_token_pool.req_to_token[row, :aligned].to(torch.int64)
+        handle = req.cache_request_handle
+        self._decode_store_seq += 1
+        store_rid = json.dumps(
+            [handle.rid, f"{handle.attempt_id}:decode-store:{self._decode_store_seq}"],
+            separators=(",", ":"),
+        )
+        task_id = self._launch_decode_store(
+            store_rid, req, list(token_ids), kv_indices, namespace_kwargs.get("namespace")
+        )
+        req._flexkv_decode_stored_len = aligned
+        if task_id < 0:
+            return  # nothing new to write; the row was never handed to FlexKV
+        self._decode_stores[store_rid] = row
+        self._decode_store_rows[row] = self._decode_store_rows.get(row, 0) + 1
+        logger.info(
+            "[FlexKV] decode store rid=%s tokens=%d (stride=%d, full_only=%s)",
+            req.rid, aligned, stride, self._decode_store_full_only,
+        )
+
+    def _forget_decode_stores(self, completed_rids) -> None:
+        stores = self.__dict__.get("_decode_stores")
+        if not stores:
+            return
+        for rid in completed_rids:
+            row = stores.pop(rid, None)
+            if row is None:
+                continue
+            left = self._decode_store_rows.get(row, 0) - 1
+            if left > 0:
+                self._decode_store_rows[row] = left
+            else:
+                self._decode_store_rows.pop(row, None)
+
+    def _fence_decode_stores(self, row: Optional[int]) -> None:
+        """Wait until no mid-decode store reads KV row ``row``.
+
+        Called on every TP/CP rank for the same request in the same order
+        (release_kv_cache), and the store-completion poll is a cross-rank
+        protocol whose result the leader decides, so the ranks leave the loop
+        together."""
+        rows = self.__dict__.get("_decode_store_rows")
+        if not rows or row is None or not rows.get(int(row)):
+            return
+        row = int(row)
+        start = time.perf_counter()
+        while self._decode_store_rows.get(row):
+            self._drain_completed_stores()
+            if self._decode_store_rows.get(row):
+                time.sleep(0.0002)
+        waited_ms = (time.perf_counter() - start) * 1e3
+        if waited_ms > 1.0:
+            logger.info("[FlexKV] waited %.1f ms for decode stores of row %d", waited_ms, row)
+
+    def _fence_request_decode_stores(self, req: Req) -> None:
+        if self.__dict__.get("_decode_store_rows"):
+            self._fence_decode_stores(req.kv.req_pool_idx)
+
+    def free_kv_row(self, kv, ranges) -> None:
+        # A mid-decode store may still be reading these slots.
+        if self.__dict__.get("_decode_store_rows"):
+            self._fence_decode_stores(kv.req_pool_idx)
+        super().free_kv_row(kv, ranges)
+
+    def _reset_decode_offload(self) -> None:
+        # Only after connector.reset fenced every launched transfer.
+        if "_decode_stores" in self.__dict__:
+            self._decode_stores.clear()
+            self._decode_store_rows.clear()
+
     def _init_restore_state(self) -> None:
         self._restore_leases: dict[str, _RestoreLease] = {}
         self._aborted_restore_leases: dict[int, _RestoreLease] = {}

@@ -61,9 +61,14 @@ class _StoreRequest:
     token_ids: list[int]
     kv_indices: torch.Tensor
     namespace: Optional[list[str]] = None
+    # False: Full KV only, no SWA/state snapshot (mid-decode stores).
+    swa: bool = True
 
 
 class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
+    # A mid-decode window would only serve a resume at exactly that point.
+    _decode_store_full_only = True
+
     """Compose FlexKV I/O with an existing hybrid radix implementation.
 
     The inner cache remains the sole owner of radix/SWA bookkeeping. FlexKV
@@ -147,6 +152,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
 
         self._load_markers: dict[str, _LoadMarker] = {}
         self._init_restore_state()
+        self._init_decode_offload()
         self._inflight_store_nodes: dict[str, tuple[Any, DecLockRefParams]] = {}
         self._store_generation = 0
         self._profile_store_stages = os.getenv(
@@ -169,6 +175,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         self._load_markers.clear()
         with self._node_lock:
             self._inflight_store_nodes.clear()
+        self._reset_decode_offload()
 
     def release_host_resources(self) -> None:
         self.token_to_kv_pool_host.destroy()
@@ -447,6 +454,8 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         return False
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        # The insert may free the request's duplicate slots a mid-decode store reads.
+        self._fence_request_decode_stores(req)
         self._validate_restore_lease(req)
         self._apply_restore_swa_boundary(req)
         grid_tokens = self._swa_grid_tokens
@@ -539,6 +548,18 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                 lock_result.to_dec_params(),
             )
 
+    def _launch_decode_store(self, store_rid, req, token_ids, kv_indices, namespace) -> int:
+        return self._launch_store(
+            _StoreRequest(
+                store_key=store_rid,
+                sglang_req_id=req.rid,
+                token_ids=token_ids,
+                kv_indices=kv_indices,
+                namespace=namespace,
+                swa=False,
+            )
+        )
+
     def _launch_store(self, pending: _StoreRequest) -> int:
         indices = pending.kv_indices
         store_stream = getattr(self.flexkv_connector, "store_stream", None)
@@ -572,6 +593,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                         if pending.namespace is not None
                         else {}
                     ),
+                    **({} if pending.swa else {"swa": False}),
                 )
 
     def _store_profile_scope(self, name: str):
@@ -605,6 +627,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         completed = self.flexkv_connector.check_completed_stores()
         if not completed:
             return
+        self._forget_decode_stores(completed)
         with self._node_lock:
             for rid in completed:
                 tracked = self._inflight_store_nodes.pop(rid, None)

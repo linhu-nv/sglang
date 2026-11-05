@@ -853,6 +853,10 @@ class Envs:
     # snapshot; 0 keeps the turn-end-only behavior. Each grid point costs one
     # host SWA pool slot.
     SGLANG_FLEXKV_SWA_GRID_PAGES = EnvInt(0)
+    # Also store a decoding request's KV to FlexKV every N generated tokens
+    # (page-aligned), so the store at finish only writes the tail; 0 stores at
+    # finish only. SWA models store Full KV only mid-decode.
+    SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE = EnvInt(0)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport

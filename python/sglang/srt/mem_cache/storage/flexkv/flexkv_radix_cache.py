@@ -201,6 +201,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         # IP-mode restores that are allocated and being written by the
         # layerwise H2D engine, but not yet committed to the radix tree.
         self._init_restore_state()
+        self._init_decode_offload()
         self._node_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -227,6 +228,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                 self._inflight_store_nodes.clear()
                 self._pending_store_launches.clear()
                 self._pending_store_copies.clear()
+        self._reset_decode_offload()
         super().reset()
 
     def release_host_resources(self) -> None:
@@ -651,6 +653,8 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
 
     def checkpoint(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
         """Commit restores, insert into the radix tree, and store finished KV."""
+        # The insert may free the request's duplicate slots a mid-decode store reads.
+        self._fence_request_decode_stores(req)
         self._validate_restore_lease(req)
         if getattr(req, "_flexkv_uncached_restore", False):
             # Restored IP/layerwise slots are request-owned until this insertion.
@@ -754,6 +758,14 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             self._inflight_store_nodes[_request_key(req.cache_request_handle)] = (
                 new_last_node
             )
+
+    def _launch_decode_store(self, store_rid, req, token_ids, kv_indices, namespace) -> int:
+        return self._launch_store(
+            store_rid,
+            token_ids,
+            kv_indices,
+            **({"namespace": namespace} if namespace is not None else {}),
+        )
 
     def _launch_store(
         self,
@@ -921,6 +933,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         completed_rids = self.flexkv_connector.check_completed_stores()
         if not completed_rids:
             return
+        self._forget_decode_stores(completed_rids)
         with self._node_lock:
             for rid in completed_rids:
                 node = self._inflight_store_nodes.pop(rid, None)

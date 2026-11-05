@@ -1366,6 +1366,15 @@ class SchedulerBatchResultProcessor:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.time_stats.set_completion_time()
 
+    def _flexkv_decode_offload_stride(self, batch: ScheduleBatch) -> int:
+        """FlexKV's mid-decode store stride (0 = off), resolved once. Off for
+        speculative decoding, whose KV commit point is not the output length."""
+        stride = self.__dict__.get("_flexkv_decode_stride")
+        if stride is None:
+            stride = self.tree_cache.decode_offload_stride if self.enable_flexkv else 0
+            self._flexkv_decode_stride = stride
+        return stride if stride and batch.spec_algorithm.is_none() else 0
+
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -1423,6 +1432,14 @@ class SchedulerBatchResultProcessor:
             and not req.finished()
         ):
             self.decode_offload_manager.offload_kv_cache(req)
+
+        if (
+            self._flexkv_decode_offload_stride(batch)
+            and not req.finished()
+            and not req.is_retracted
+            and not req.skip_radix_cache_insert
+        ):
+            self.tree_cache.store_decode_progress(req)
 
         if req.finished():
             if not self._mamba_can_cache_finished_req(req, result, i):
