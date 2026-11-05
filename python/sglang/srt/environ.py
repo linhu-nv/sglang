@@ -783,6 +783,10 @@ class Envs:
     # ===================================================================
     SGLANG_FLEXKV_SWA_GRID_PAGES = EnvInt(0)
     SGLANG_FLEXKV_PENDING_PREFIX_PROBE = EnvBool(False)
+    # Also store a decoding request's KV to FlexKV every N generated tokens
+    # (page-aligned), so the store at finish only writes the tail; 0 stores at
+    # finish only. SWA models store Full KV only mid-decode.
+    SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE = EnvInt(0)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
