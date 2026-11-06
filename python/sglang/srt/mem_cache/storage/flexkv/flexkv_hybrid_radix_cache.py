@@ -635,6 +635,30 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                     node, dec_params = tracked
                     self._inner_cache.dec_lock_ref(node, dec_params)
 
+    def claim_kv_row(self, req: Req) -> bool:
+        # A release without checkpoint (a chunked prefill aborted after its
+        # load-back) frees the row as is. The restore allocated SWA slots for
+        # the tail page only, so mark the range below it SWA-dead first, as
+        # checkpoint does; otherwise the free returns SWA slots never taken.
+        self._apply_restore_swa_boundary(req)
+        return False
+
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if checkpointed:
+            return
+        # The row free above returned the restored slots: drop their lease,
+        # or a later reset frees them a second time.
+        rid = _request_key(req.cache_request_handle)
+        lease = self._restore_leases.get(rid)
+        if lease is None or lease.req is not req:
+            lease = next(
+                (item for item in self._aborted_restore_leases.values() if item.req is req),
+                None,
+            )
+        if lease is not None and self._restore_lease_matches_req(req, lease):
+            self._forget_restore_lease(lease)
+        self._release_load_marker(req.cache_request_handle)
+
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         rid = _request_key(handle)
         self._load_markers.pop(rid, None)

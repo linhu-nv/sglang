@@ -960,3 +960,26 @@ def test_hybrid_reset_fences_connector_before_reclaiming_slots(failure):
         assert cache.has_uncommitted_restore(req)
         cache.token_to_kv_pool_allocator.free.assert_not_called()
         cache._inner_cache.reset.assert_not_called()
+
+
+def test_release_without_checkpoint_frees_a_restore_once():
+    """A chunked prefill aborted after its load-back is released without checkpoint:
+    the range below the restored SWA tail is SWA-dead and reset must not free the slots again."""
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+    cache, req, params, _ = _make_layerwise_restore()
+    cache.init_load_back(params)
+    evicted = {}
+    req.kv.get_evicted_seqlen = lambda comp: evicted.get(comp, 0)
+    req.kv.set_evicted_seqlen = lambda comp, value: evicted.__setitem__(comp, value)
+    req._flexkv_swa_evicted_seqlen = 4
+    cache.release_aborted_request(req.cache_request_handle)
+
+    assert cache.claim_kv_row(req) is False
+    assert evicted[ComponentType.SWA] == 4
+    assert not hasattr(req, "_flexkv_swa_evicted_seqlen")
+    cache.on_release(req, checkpointed=False)
+    assert cache._aborted_restore_leases == {}
+    assert not cache.has_uncommitted_restore(req)
+    cache.reset()
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
