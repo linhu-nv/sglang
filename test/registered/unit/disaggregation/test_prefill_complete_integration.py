@@ -794,30 +794,46 @@ class TestAllocationIntegration(CustomTestCase):
         queue.kv_manager.submit_prefill_recompute.assert_not_called()
         self.assertFalse(entry.waiting_for_input)
 
-    def test_rebootstrap_keeps_room_and_prefill_rank(self):
+    def test_rebootstrap_renews_room_and_keeps_prefill_rank(self):
+        """Each rebootstrap round gets its own room, so a late clear of the
+        previous round on prefill cannot drop its decode registration."""
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
         queue.queue = []
         queue.pending_reqs = []
         queue._create_receiver_and_enqueue = Mock()
         queue._init_receiver = Mock()
-        req = SimpleNamespace(
-            bootstrap_room=1,
-            bootstrap_host="prefill",
-            bootstrap_port=8998,
-            disagg_prefill_dp_rank=3,
-        )
+
+        def make_req():
+            return SimpleNamespace(
+                rid="r",
+                bootstrap_room=6,
+                bootstrap_host="prefill",
+                bootstrap_port=8998,
+                disagg_prefill_dp_rank=3,
+                pd_rebootstrap_round=0,
+            )
+
+        req = make_req()
         queue.kv_manager = SimpleNamespace(
             prefill_info_table={"prefill:8998": SimpleNamespace(dp_size=4)}
         )
         queue.add(req, is_rebootstrap=True)
-        self.assertEqual(req.bootstrap_room, 1)
+        first = req.bootstrap_room
+        self.assertNotEqual(first, 6)
+        self.assertEqual(first % 4, 6 % 4)
         queue._init_receiver.assert_called_once_with(
             queue._create_receiver_and_enqueue.return_value, 3
         )
         queue.add(req, is_rebootstrap=True)
-        self.assertEqual(req.bootstrap_room, 1)
+        self.assertNotIn(req.bootstrap_room, (6, first))
+        self.assertEqual(req.bootstrap_room % 4, 6 % 4)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
+        self.assertEqual(req.pd_rebootstrap_round, 2)
+        # Every rank of the request derives the same room.
+        twin = make_req()
+        queue.add(twin, is_rebootstrap=True)
+        self.assertEqual(twin.bootstrap_room, first)
 
 
 if __name__ == "__main__":

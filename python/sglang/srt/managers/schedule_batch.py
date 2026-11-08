@@ -1429,6 +1429,9 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        # Decode-local: rebootstrap rounds so far; each round gets its own
+        # bootstrap room and prefill-side rid.
+        self.pd_rebootstrap_round: int = 0
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -2213,7 +2216,7 @@ class Req(ReqDllmMixin):
             },
             "return_logprob": False,
             "stream": False,
-            "rid": self.rid,
+            "rid": f"{self.rid}-rebootstrap{self.pd_rebootstrap_round}",
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,

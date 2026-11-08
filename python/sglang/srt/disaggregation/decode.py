@@ -835,6 +835,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        if is_rebootstrap and not _is_fake_transfer(req):
+            self._renew_rebootstrap_room(req)
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -875,6 +878,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self._build_decode_prefix_match(
             req, result, max_prefix_len=max_prefix_len
         )
+
+    def _renew_rebootstrap_room(self, req: Req) -> None:
+        """Give a rebootstrap round its own bootstrap room (and /generate rid).
+
+        Decode sees the previous round's transfer succeed before the prefill
+        scheduler retires that round: its sender clears the room's transfer state
+        and its tokenizer drops the rid only afterwards. A recompute that reuses
+        them can be rejected as a duplicate rid, or have its decode registration
+        dropped by that late clear and wait in Bootstrapping until it times out.
+        The new room is derived from the request so every rank of it agrees, and
+        keeps the old room's residue so a room-routed prefill stays on its rank.
+        """
+        req.pd_rebootstrap_round += 1
+        digest = hashlib.blake2b(
+            f"{req.rid}:{req.bootstrap_room}:{req.pd_rebootstrap_round}".encode(),
+            digest_size=8,
+        ).digest()
+        room = int.from_bytes(digest, "little") & ((1 << 63) - 1)
+        prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
+        modulus = prefill_info.dp_size if prefill_info is not None else 1
+        if req.bootstrap_room is not None and modulus > 1:
+            room += req.bootstrap_room % modulus - room % modulus
+            if room < 0:
+                room += modulus
+        req.bootstrap_room = room
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))

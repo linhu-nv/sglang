@@ -94,6 +94,7 @@ def _decode_queue(sched):
             return_value=SimpleNamespace(kv_receiver=MagicMock())
         ),
         _resolve_prefill_dp_rank=MagicMock(return_value=0),
+        _renew_rebootstrap_room=MagicMock(),
     )
     # Exercise the production initializer reached by the cache-hit fast path.
     q._init_receiver = MethodType(DecodePreallocQueue._init_receiver, q)
