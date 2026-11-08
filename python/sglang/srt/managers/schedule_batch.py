@@ -803,6 +803,9 @@ class Req(ReqDllmMixin):
         self.bootstrap_room: Optional[int] = bootstrap_room
         # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
         self.linker_offload_skip_prefix_len = 0
+        # Decode-local: rebootstrap rounds so far; each round gets its own
+        # bootstrap room and prefill-side rid.
+        self.pd_rebootstrap_round: int = 0
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -1622,7 +1625,7 @@ class Req(ReqDllmMixin):
             },
             "return_logprob": False,
             "stream": False,
-            "rid": self.rid,
+            "rid": f"{self.rid}-rebootstrap{self.pd_rebootstrap_round}",
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
