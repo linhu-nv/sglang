@@ -146,6 +146,13 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         )
         if self.flexkv_connector.enable_layerwise:
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
+        # Opt-in: prepare each admitted restore and launch the batch's restores
+        # as one merged layerwise transfer (launch_pending_loads).
+        self._batch_layerwise = (
+            self.flexkv_connector.enable_layerwise
+            and os.environ.get("FLEXKV_BATCH_LAYERWISE_RESTORE", "0") == "1"
+            and callable(getattr(self.flexkv_connector, "flush_layerwise_loads", None))
+        )
 
         # Same hook HiCache uses: scheduler.release_host_resources → destroy().
         self.token_to_kv_pool_host = FlexKVHostReleaseShim(self.flexkv_connector)
@@ -286,6 +293,13 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             cache_protected_len=device_length,
         )
 
+    def launch_pending_loads(self, reqs: list[Req]) -> None:
+        """Submit the restores prepared during admission as one batch."""
+        if getattr(self, "_batch_layerwise", False):
+            self.flexkv_connector.flush_layerwise_loads(
+                [_request_key(req.cache_request_handle) for req in reqs]
+            )
+
     def init_load_back(self, params: InitLoadBackParams) -> tuple[int, Any]:
         req = params.req
         if _request_key(req.cache_request_handle) in self._restore_leases:
@@ -301,7 +315,14 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             return 0, req.last_node
 
         device_indices = self._alloc_restore_slots(req, params.host_hit_length)
-        if device_indices is None:
+        # Every rank must agree before any of them enters the restore collectives.
+        sync_ready = getattr(self.flexkv_connector, "sync_load_ready", None)
+        ready = device_indices is not None
+        if callable(sync_ready):
+            ready = sync_ready(ready)
+        if not ready:
+            if device_indices is not None:
+                self.token_to_kv_pool_allocator.free(device_indices)
             self.flexkv_connector.release_pending(
                 _request_key(req.cache_request_handle)
             )
@@ -314,7 +335,9 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
 
         if self.flexkv_connector.enable_layerwise:
             loaded, _ = self.flexkv_connector.start_load_kv_layerwise(
-                _request_key(req.cache_request_handle), device_indices
+                _request_key(req.cache_request_handle),
+                device_indices,
+                **({"defer_launch": True} if getattr(self, "_batch_layerwise", False) else {}),
             )
         else:
             loaded = self.flexkv_connector.retrieve_kv(
