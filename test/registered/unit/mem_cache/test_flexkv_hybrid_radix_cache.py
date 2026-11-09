@@ -928,3 +928,32 @@ def test_discard_applies_restored_swa_boundary_before_freeing_row():
     assert not hasattr(req, "_flexkv_swa_evicted_seqlen")
     cache.on_release(req, checkpointed=False)
     assert req.pending_restore_slots is None
+
+
+def test_hybrid_batched_layerwise_restore_defers_until_admission():
+    """With FLEXKV_BATCH_LAYERWISE_RESTORE the hybrid restore is prepared at
+    load-back and launched once for the admitted batch."""
+    cache, req, params, restored = _make_layerwise_restore()
+    cache._batch_layerwise = True
+
+    assert cache.init_load_back(params)[0] == restored.numel()
+    _, kwargs = cache.flexkv_connector.start_load_kv_layerwise.call_args
+    assert kwargs == {"defer_launch": True}
+    cache.flexkv_connector.flush_layerwise_loads.assert_not_called()
+
+    cache.launch_pending_loads([req])
+    cache.flexkv_connector.flush_layerwise_loads.assert_called_once_with(
+        [_tracking_key(req.rid)]
+    )
+
+
+def test_hybrid_restore_allocation_vote_cancels_on_any_rank_failure():
+    cache, req, params, restored = _make_layerwise_restore()
+    cache.flexkv_connector.sync_load_ready = MagicMock(return_value=False)
+
+    assert cache.init_load_back(params)[0] == 0
+    cache.token_to_kv_pool_allocator.free.assert_called_once_with(restored)
+    cache.flexkv_connector.release_pending.assert_called_once_with(
+        _tracking_key(req.rid)
+    )
+    cache.flexkv_connector.start_load_kv_layerwise.assert_not_called()
