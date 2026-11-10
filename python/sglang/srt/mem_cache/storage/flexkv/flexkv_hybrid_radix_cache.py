@@ -36,7 +36,9 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
     FlexKVCacheLifecycleMixin,
+    _block_hash_kwargs,
     _namespace_kwargs,
+    _namespace_parts,
     _request_key,
 )
 
@@ -279,6 +281,13 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             rid=_request_key(params.req.cache_request_handle),
             sglang_req_id=params.req.rid,
             **namespace_kwargs,
+            **_block_hash_kwargs(
+                self.flexkv_connector,
+                token_ids,
+                self.page_size,
+                key.extra_key,
+                key.cache_salt,
+            ),
         )
         if hit_length <= 0:
             return result
@@ -617,6 +626,12 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                         else {}
                     ),
                     **({} if pending.swa else {"swa": False}),
+                    **_block_hash_kwargs(
+                        self.flexkv_connector,
+                        pending.token_ids,
+                        self.page_size,
+                        *_namespace_parts(pending.namespace),
+                    ),
                 )
 
     def _store_profile_scope(self, name: str):

@@ -11,8 +11,9 @@ import logging
 import time
 from array import array
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -21,6 +22,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import (
+    get_hash_str,
+    hash_str_to_int64,
+    storage_namespace_seed,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -50,6 +56,39 @@ def _namespace_kwargs(connector, extra_key, cache_salt) -> Optional[dict]:
                 ["sglang-cache-v1", extra_key, cache_salt], separators=(",", ":")
             )
         ]
+    }
+
+
+def _namespace_parts(namespace: Optional[list[str]]) -> tuple[Any, Any]:
+    """``(extra_key, cache_salt)`` back from a namespace :func:`_namespace_kwargs` built."""
+    if not namespace:
+        return None, None
+    _, extra_key, cache_salt = json.loads(namespace[0])
+    return extra_key, cache_salt
+
+
+def _block_hash_kwargs(
+    connector,
+    token_ids: Sequence[int],
+    page_size: int,
+    extra_key=None,
+    cache_salt=None,
+) -> dict:
+    """``block_hashes`` for a FlexKV that keys blocks by SGLang's page hashes: the
+    namespace-seeded SHA-256 page chain of HiCache storage keys, as signed int64,
+    which a router can recompute from request tokens. Empty otherwise."""
+    if getattr(connector, "wants_caller_block_hashes", False) is not True:
+        return {}
+    n = len(token_ids) // page_size * page_size
+    if n == 0:
+        return {"block_hashes": np.empty(0, dtype=np.int64)}
+    pages = get_hash_str(
+        list(token_ids[:n]), storage_namespace_seed(extra_key, cache_salt), page_size
+    )
+    return {
+        "block_hashes": np.fromiter(
+            (hash_str_to_int64(h) for h in pages), dtype=np.int64, count=len(pages)
+        )
     }
 
 
@@ -349,6 +388,9 @@ class FlexKVCacheLifecycleMixin:
         ids = ids[: len(ids) // self.page_size * self.page_size]
         if len(ids) <= len(prefix):
             return
+        hash_kwargs = _block_hash_kwargs(
+            self.flexkv_connector, ids, self.page_size, extra_key, cache_salt
+        )
         if getattr(self.flexkv_connector, "_chunked_prefetch", False):
             self.flexkv_connector.prefetch_async(
                 rid,
@@ -356,10 +398,11 @@ class FlexKVCacheLifecycleMixin:
                 sglang_req_id=handle.rid,
                 candidate_start_token=len(prefix),
                 **namespace_kwargs,
+                **hash_kwargs,
             )
         else:
             self.flexkv_connector.prefetch_async(
-                rid, ids, sglang_req_id=handle.rid, **namespace_kwargs
+                rid, ids, sglang_req_id=handle.rid, **namespace_kwargs, **hash_kwargs
             )
 
     def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:

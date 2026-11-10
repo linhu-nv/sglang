@@ -1535,3 +1535,63 @@ def test_partial_tree_owned_restore_reports_atomic_admission_miss():
     matched = RadixCache.match_prefix(cache, MatchPrefixParams(key=key))
     assert matched.device_prefix_len == 4
     assert cache.evictable_size() == 4
+
+
+def _expected_page_hashes(tokens, extra_key, cache_salt, page_size=4):
+    from sglang.srt.mem_cache.utils import (
+        get_hash_str,
+        hash_str_to_int64,
+        storage_namespace_seed,
+    )
+
+    pages = get_hash_str(
+        list(tokens), storage_namespace_seed(extra_key, cache_salt), page_size
+    )
+    return [hash_str_to_int64(h) for h in pages]
+
+
+@pytest.mark.parametrize("salt", [None, "tenant-a"])
+def test_lookup_and_store_name_blocks_with_sglang_page_hashes(salt):
+    """A FlexKV that keys blocks by the engine's hashes gets SGLang's storage
+    page chain (namespace-seeded) on lookup and on store, for the same tokens
+    the same names -- the keys a router recomputes from a request."""
+    cache, allocator = _make_cache(page_size=4)
+    connector = cache.flexkv_connector
+    connector.supports_cache_namespace = True
+    connector.wants_caller_block_hashes = True
+    connector.lookup_kv.return_value = (-1, 0)
+    tokens = list(range(1, 10))           # two full pages + a partial one
+    req = SimpleNamespace(
+        cache_request_handle=CacheRequestHandle("hashed", 0), rid="hashed"
+    )
+    key = RadixKey(array("q", tokens), cache_salt=salt)
+    cache.match_prefix(MatchPrefixParams(key=key, req=req))
+    want = _expected_page_hashes(tokens[:8], None, salt)
+    looked_up = connector.lookup_kv.call_args.kwargs["block_hashes"]
+    assert looked_up.tolist() == want
+
+    # Stores name blocks at launch, from the namespace the checkpoint recorded.
+    connector.store_kv.return_value = 17
+    namespace = _namespace_kwargs(connector, None, salt).get("namespace")
+    with patch(
+        "torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()
+    ):
+        cache._launch_store(
+            _tracking_key("hashed-store"),
+            tokens[:8],
+            torch.arange(4, 12, dtype=torch.int64),
+            namespace=namespace,
+            mapping_already_on_cpu=True,
+            skip_mapping_validation=True,
+        )
+    assert connector.store_kv.call_args.kwargs["block_hashes"].tolist() == want
+
+
+def test_flexkv_hashing_its_own_blocks_gets_no_hashes():
+    cache, _ = _make_cache(page_size=4)
+    cache.flexkv_connector.lookup_kv.return_value = (-1, 0)
+    req = SimpleNamespace(cache_request_handle=CacheRequestHandle("plain", 0), rid="plain")
+    cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", range(8))), req=req)
+    )
+    assert "block_hashes" not in cache.flexkv_connector.lookup_kv.call_args.kwargs
