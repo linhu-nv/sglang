@@ -16,7 +16,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import _namespace_kwargs
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
+    _block_hash_kwargs,
+    _namespace_kwargs,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -67,6 +71,7 @@ def method(path, cls, name):
         "InitLoadBackParams": object,
         "_RestoreLease": NS,
         "_namespace_kwargs": _namespace_kwargs,
+        "_block_hash_kwargs": _block_hash_kwargs,
         "logger": logging.getLogger(__name__),
     }
     exec(

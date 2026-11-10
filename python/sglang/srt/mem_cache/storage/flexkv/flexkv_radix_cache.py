@@ -54,7 +54,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
     FlexKVCacheLifecycleMixin,
+    _block_hash_kwargs,
     _namespace_kwargs,
+    _namespace_parts,
     _request_key,
 )
 
@@ -307,6 +309,13 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             rid=_request_key(req.cache_request_handle),
             sglang_req_id=req.rid,
             **namespace_kwargs,
+            **_block_hash_kwargs(
+                self.flexkv_connector,
+                token_ids,
+                self.page_size,
+                key.extra_key,
+                key.cache_salt,
+            ),
         )
         if hit <= 0:
             return base_res
@@ -519,6 +528,13 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                 sglang_req_id=sglang_req_id,
                 **_namespace_kwargs(
                     self.flexkv_connector, key.extra_key, key.cache_salt
+                ),
+                **_block_hash_kwargs(
+                    self.flexkv_connector,
+                    token_ids,
+                    self.page_size,
+                    key.extra_key,
+                    key.cache_salt,
                 ),
             )
             uncached_len = min(uncached_len, target_end - refreshed_len)
@@ -792,6 +808,12 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                     kv_indices=kv_indices,
                     sglang_req_id=json.loads(rid)[0],
                     **({"namespace": namespace} if namespace is not None else {}),
+                    **_block_hash_kwargs(
+                        self.flexkv_connector,
+                        token_ids,
+                        self.page_size,
+                        *_namespace_parts(namespace),
+                    ),
                 )
 
     def _store_profile_scope(self, name: str):
