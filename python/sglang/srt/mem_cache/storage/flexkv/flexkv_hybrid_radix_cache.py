@@ -470,7 +470,8 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         self._release_load_marker(req.cache_request_handle)
         if req.finished():
             self._store_prefix(req, req.full_untruncated_fill_ids[:up_to])
-        elif self._swa_grid_tokens > 0:
+        elif self._swa_grid_tokens > 0 and not self.__dict__.get("_pd_decode", False):
+            # PD decode: the prompt came from prefill, which already stored it.
             self._store_grid_point(req, previous, self._swa_grid_tokens, up_to=up_to)
 
     def free_kv_row(self, kv, ranges) -> None:
