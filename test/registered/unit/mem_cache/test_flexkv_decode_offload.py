@@ -250,3 +250,34 @@ def test_hybrid_mid_decode_store_asks_flexkv_for_full_kv_only():
     assert task == 11
     assert cache.flexkv_connector.store_kv.call_args.kwargs["swa"] is False
 
+
+
+def test_pd_decode_counts_the_stride_from_the_prompt():
+    cache = FlexKVRadixCache.__new__(FlexKVRadixCache)
+    calls = _arm(cache)
+    cache._pd_decode = True
+    req = _req()
+    _decode(cache, req, 20)
+    # prompt 10 -> counted from 8; stores at aligned 16 and 24, each with the prompt
+    assert [len(t) for _, t, _ in calls] == [16, 24]
+    full = req.origin_input_ids + req.output_ids
+    assert calls[0][1] == full[:16]
+
+
+def test_pd_decode_prebuilt_checkpoint_skips_the_grid_store():
+    for pd_decode, want in ((False, 1), (True, 0)):
+        cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+        cache._pd_decode = pd_decode
+        cache._swa_grid_tokens = 2 * PAGE
+        cache._inner_cache = MagicMock()
+        for name in ("_fence_request_decode_stores", "_validate_restore_lease",
+                     "_apply_restore_swa_boundary", "_commit_restore", "_release_load_marker"):
+            setattr(cache, name, lambda *a, **k: None)
+        cache._store_grid_point = MagicMock()
+        req = SimpleNamespace(
+            finished=lambda: False,
+            kv=SimpleNamespace(cache_protected_len=0),
+            cache_request_handle=None,
+        )
+        cache.checkpoint(req, up_to=24)
+        assert cache._store_grid_point.call_count == want

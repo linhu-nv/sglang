@@ -138,7 +138,17 @@ class FlexKVCacheLifecycleMixin:
         aligned = committed // self.page_size * self.page_size
         if self._decode_store_full_only:
             aligned -= self.page_size
-        stored = getattr(req, "_flexkv_decode_stored_len", 0)
+        stored = getattr(req, "_flexkv_decode_stored_len", None)
+        if stored is None:
+            if self.__dict__.get("_pd_decode", False):
+                # PD decode: prefill stores the prompt it computed. Count the
+                # stride from the prompt, so the first store here carries it
+                # with new output once prefill's copy is visible cluster-wide.
+                req._flexkv_decode_stored_len = (
+                    len(req.origin_input_ids) // self.page_size * self.page_size
+                )
+                return
+            stored = 0
         if aligned - stored < stride or aligned <= 0:
             return
         namespace_kwargs = _namespace_kwargs(

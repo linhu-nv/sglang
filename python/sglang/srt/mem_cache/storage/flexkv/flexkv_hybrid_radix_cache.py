@@ -503,7 +503,8 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         self._release_load_marker(req.cache_request_handle)
 
         if not req.finished():
-            if grid_tokens > 0:
+            # PD decode: the prompt came from prefill, which already stored it.
+            if grid_tokens > 0 and not self.__dict__.get("_pd_decode", False):
                 self._store_grid_point(req, prev_protected_len, grid_tokens)
             return
 
