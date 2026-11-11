@@ -578,6 +578,11 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             # active. Reset retains the allocation until the connector drains.
             self._register_restore_lease(request_owned_req, token_slots)
 
+        if request_owned_req is None:
+            # FlexKV copies into these slots from another process, unordered with
+            # our queued kernels: with the overlap scheduler the previous batch may
+            # still write slots freed while it ran and reallocated here.
+            torch.cuda.synchronize()
         num_retrieved = load_fn(token_slots.to(torch.int64))
 
         if num_retrieved <= 0:

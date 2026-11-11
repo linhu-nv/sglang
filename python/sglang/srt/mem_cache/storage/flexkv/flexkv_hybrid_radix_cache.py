@@ -349,6 +349,8 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                 **({"defer_launch": True} if getattr(self, "_batch_layerwise", False) else {}),
             )
         else:
+            # Same fence as FlexKVRadixCache._allocate_and_load.
+            torch.cuda.synchronize()
             loaded = self.flexkv_connector.retrieve_kv(
                 _request_key(req.cache_request_handle), device_indices
             )
