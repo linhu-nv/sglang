@@ -787,6 +787,11 @@ class Envs:
     # (page-aligned), so the store at finish only writes the tail; 0 stores at
     # finish only. SWA models store Full KV only mid-decode.
     SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE = EnvInt(0)
+    # Attention-DP prefill: size a chunked request's next chunk from a profiled
+    # quadratic cost model (JSON {"a","b","c"}) so it fits the time of a base chunk.
+    SGLANG_DP_PREFILL_BUDGET = EnvStr("")
+    SGLANG_DP_PREFILL_BUDGET_SCALE = EnvFloat(1.0)
+    SGLANG_DP_PREFILL_BUDGET_CAP = EnvInt(32768)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)

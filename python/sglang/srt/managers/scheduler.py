@@ -269,6 +269,9 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
     SchedulerDPAttnAdapter,
     should_skip_scheduler_all_gather,
 )
+from sglang.srt.managers.scheduler_components.dp_prefill_budget import (
+    DPPrefillBudget,
+)
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
@@ -720,6 +723,7 @@ class Scheduler(
         # Init chunked prefill
         self.init_chunked_prefill()
         self.maybe_init_dynamic_chunk_sizer()
+        self.maybe_init_dp_prefill_budget()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -1469,6 +1473,14 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+
+    def maybe_init_dp_prefill_budget(self) -> None:
+        """Time-budgeted chunk sizing for attention-DP prefill (SGLANG_DP_PREFILL_BUDGET)."""
+        self.dp_prefill_budget: Optional[DPPrefillBudget] = None
+        if get_parallel().attn_dp_size > 1:
+            self.dp_prefill_budget = DPPrefillBudget.from_env(
+                base_chunk=self.chunked_prefill_size, page_size=self.page_size
+            )
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -4627,6 +4639,10 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        elif self.chunked_req is not None and self.dp_prefill_budget is not None:
+            chunked_prefill_size = self.dp_prefill_budget.chunk_for(
+                self.chunked_req.prefix_len
+            )
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
