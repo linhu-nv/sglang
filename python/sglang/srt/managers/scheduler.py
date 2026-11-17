@@ -447,6 +447,8 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_STEP_STATS_DIR = os.environ.get("SGLANG_STEP_STATS_DIR", "")
+
 # Cap on rids printed per --log-schedule-decisions line.
 _MAX_LOGGED_RIDS = 16
 
@@ -5081,6 +5083,18 @@ class Scheduler(
             or req in self.chunked_reqs
         )
 
+    def _step_stats_logger(self):
+        stats = getattr(self, "_step_stats", None)
+        if stats is None:
+            from sglang.srt.managers.step_stats_logger import StepStatsLogger
+
+            par = get_parallel()
+            rank = getattr(par, "attn_dp_rank", None)
+            if rank is None:
+                rank = par.dp_rank if par.dp_rank is not None else 0
+            stats = self._step_stats = StepStatsLogger(rank)
+        return stats
+
     def _on_step_launch(self, batch: ScheduleBatch) -> Optional[ForwardLaunch]:
         """The bookkeeping of every step launch, before its forward is issued.
         Returns the unified pool's launch record, which the step's result
@@ -5088,6 +5102,8 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        if _STEP_STATS_DIR:
+            self._step_stats_logger().on_launch(batch)
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
@@ -5839,6 +5855,8 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.deferred_responses.stream_released()
+        if _STEP_STATS_DIR:
+            self._step_stats_logger().on_result()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
