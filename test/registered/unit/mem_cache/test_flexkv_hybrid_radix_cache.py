@@ -692,6 +692,7 @@ def _make_layerwise_restore(loaded=4):
         output_ids=array("q"),
         extra_key=None,
         cache_salt=None,
+        swa_branching_seqlen=None,
     )
     params = InitLoadBackParams(
         best_match_node=req.last_node, host_hit_length=4, req=req
@@ -765,6 +766,16 @@ def test_unexpected_layerwise_length_retains_every_slot_until_drained_reset(load
     assert order == ["drain", "free", "tree"]
     cache.token_to_kv_pool_allocator.free.assert_called_once_with(restored)
     assert not cache.has_uncommitted_restore(req)
+
+
+@pytest.mark.parametrize("branch, kept", [(4, False), (8, True)])
+def test_restore_drops_the_swa_branch_point_it_covers(branch, kept):
+    """A covered branch point would cap the finished insert, so the computed tail is never stored."""
+    cache, req, params, _ = _make_layerwise_restore()
+    req.swa_branching_seqlen = branch
+    loaded, _ = cache.init_load_back(params)
+    assert loaded == 4
+    assert req.swa_branching_seqlen == (branch if kept else None)
 
 
 def test_zero_layerwise_return_releases_prelaunch_allocation():
