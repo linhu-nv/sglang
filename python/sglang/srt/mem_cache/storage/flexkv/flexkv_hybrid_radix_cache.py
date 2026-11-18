@@ -335,6 +335,14 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             swa_tail_length = min(self.page_size, int(device_indices.numel()))
             req._flexkv_swa_evicted_seqlen = restored_end - swa_tail_length
 
+        # A branch point the restore covers is gone (as in UnifiedCacheLinker);
+        # kept, it caps the insert there and the computed tail is never stored.
+        if (
+            req.swa_branching_seqlen is not None
+            and req.swa_branching_seqlen <= marker.device_length + int(device_indices.numel())
+        ):
+            req.swa_branching_seqlen = None
+
         # The restored tail is request-owned until the normal cache completion
         # path inserts it. Preserve the pre-restore protection boundary so the
         # inner cache can deduplicate or free every restored slot correctly.
