@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
+from sglang.srt.managers.dp_pull_queue import DPPullQueue
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -227,6 +228,13 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+        pull_tokens = envs.SGLANG_DP_PULL_TOKENS.get()
+        self.pull_queue: DPPullQueue | None = (
+            DPPullQueue(get_parallel().num_dp_ranks, budget_tokens=pull_tokens)
+            if pull_tokens > 0 and get_parallel().num_dp_ranks > 1
+            else None
+        )
+        self._last_pull_refresh = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -366,6 +374,11 @@ class DataParallelController:
         req.time_stats = wrap_as_pickle(time_stats)
         if is_health_check:
             self.dispatch_health_check(req)
+        elif self.pull_queue is not None and req.routed_dp_rank is None:
+            # Held as is (time_stats still wrapped for IPC) until a rank has room.
+            self.pull_queue.push(req, prompt_tokens=self._prompt_tokens(req))
+            self._pump_pull_queue()
+            return
         else:
             self.dispatching(req)
         req.time_stats = time_stats
@@ -386,6 +399,29 @@ class DataParallelController:
         for req in batch_req:
             self.dispatching_with_trace(req, refresh_load_budget=False)
 
+    def handle_abort(self, req: AbortReq):
+        """Drop an aborted request still held for late binding, then forward the abort."""
+        if self.pull_queue is not None:
+            self.pull_queue.remove(lambda r: req.abort_all or r.rid == req.rid)
+        self.send_to_all_workers(req)
+
+    @staticmethod
+    def _prompt_tokens(req: Req) -> int:
+        return len(req.input_ids) if req.input_ids is not None else len(req.input_embeds)
+
+    def _pump_pull_queue(self):
+        """Send held requests to ranks whose queued prefill work fell below the budget."""
+        queue = self.pull_queue
+        if queue is None or not len(queue):
+            return
+        now = time.perf_counter()
+        # Ranks publish a snapshot after every prefill step; 2 ms bounds the shm reads.
+        if now - self._last_pull_refresh >= 0.002:
+            self._last_pull_refresh = now
+            queue.update(self.load_snapshot_reader.read_all())
+        for req, rank in queue.pop_ready(self._active_workers):
+            sock_send(self.workers[rank], req)
+
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -397,7 +433,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 # A scheduler ignores an abort for a rid it has not received yet,
                 # so every DP rank gets the abort on the socket its requests use.
-                (AbortReq, self.send_to_all_workers),
+                (AbortReq, self.handle_abort),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
                     ElasticScaleUpdateReq,
@@ -923,6 +959,7 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+            self._pump_pull_queue()
 
 
 def run_scheduler_process_with_init_pipe(run_scheduler_process_func: Callable, pipe):
