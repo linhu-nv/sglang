@@ -791,6 +791,8 @@ class Scheduler(
         self.maybe_init_mm_feature_receive_budget()
 
         self.init_dp_attn_adapter()
+        # Adaptive DP/CP: lane and per-step plan (needs the DP adapter and lists).
+        self.init_adaptive_cp()
 
         self.init_pool_stats_observer()
 
@@ -1411,6 +1413,8 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
+        # Set by init_adaptive_cp when adaptive DP/CP is on.
+        self.adaptive_cp = None
         # Read on every prefill pass, so cache it.
         self.log_schedule_decisions = get_observability().log_schedule_decisions
         # The running decoding batch for continuous batching
@@ -2224,7 +2228,8 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
+                with self._adaptive_cp_scope(batch):
+                    result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -2282,7 +2287,8 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                with self._adaptive_cp_scope(batch):
+                    batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -2308,6 +2314,11 @@ class Scheduler(
 
             self.invariant_checker.run(CheckPhase.BUSY, batch)
 
+    def _adaptive_cp_scope(self, batch: ScheduleBatch):
+        if self.adaptive_cp is None:
+            return nullcontext()
+        return self.adaptive_cp.scope(batch)
+
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
     ) -> bool:
@@ -2325,6 +2336,10 @@ class Scheduler(
                 last_batch_is_extend = last_batch.forward_mode.is_extend()
             if last_batch_is_extend:
                 return True
+
+        # A CP step's result goes first, so its next chunk is built after it.
+        if last_batch.adaptive_cp_step:
+            return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
         return last_batch.grammar_needs_sync()
@@ -2747,6 +2762,14 @@ class Scheduler(
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
+
+    def init_adaptive_cp(self) -> None:
+        """Adaptive DP/CP lane controller, when SGLANG_ADAPTIVE_CP built a CP scope."""
+        from sglang.srt.managers.scheduler_components.adaptive_cp import (
+            maybe_init_adaptive_cp,
+        )
+
+        self.adaptive_cp = maybe_init_adaptive_cp(self)
 
     def init_dp_attn_adapter(self) -> None:
         # Spec workers have no .model_runner of their own; the prefill graph
@@ -4353,6 +4376,11 @@ class Scheduler(
 
             if self.dllm_config is not None and last_batch.reqs:
                 reqs_to_exclude.update(last_batch.reqs)
+            if last_batch.adaptive_cp is not None:
+                # CP replicas and middle CP chunks are not this rank's to run; what
+                # stays may become the running batch, which runs DP from now on.
+                reqs_to_exclude.update(last_batch.adaptive_cp.unmergeable)
+                last_batch.adaptive_cp = None
 
             # Filter batch
             last_bs = last_batch.batch_size()
@@ -4382,6 +4410,17 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
+
+        if self.adaptive_cp is not None:
+            cp_batch = self.adaptive_cp.plan_step()
+            if cp_batch is not None:
+                # Every rank runs this step as CP: the MLP sync is local.
+                with self.adaptive_cp.scope(cp_batch):
+                    cp_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                        cp_batch
+                    )
+                set_schedule_time_batch(cp_batch)
+                return NextBatchPlan(batch_to_run=cp_batch, running_batch=running_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)
@@ -5077,6 +5116,7 @@ class Scheduler(
             self.uocr_runtime,
             self.deferred_responses,
             self.decode_offload_manager,
+            self.adaptive_cp,
         )
         for component in components:
             if component is None:
@@ -5894,6 +5934,8 @@ class Scheduler(
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
+            if batch.adaptive_cp is not None:
+                self.adaptive_cp.after_result(batch)
         elif batch.forward_mode.is_prebuilt():
             # An inner idle batch ran a forward (`_run_batch_prebuilt`), and
             # its launch is this result's: the host sees that forward end

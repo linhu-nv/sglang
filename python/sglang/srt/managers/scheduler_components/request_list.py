@@ -41,6 +41,9 @@ class ListKind(enum.Enum):
     UOCR_PARKED = enum.auto()
     UOCR_RELEASED = enum.auto()
     DEFERRED = enum.auto()
+    # Adaptive DP/CP lane: long cold requests waiting for or between CP steps,
+    # and the replicas of other ranks' lane requests.
+    ADAPTIVE_CP = enum.auto()
 
 
 PD_KINDS = frozenset(

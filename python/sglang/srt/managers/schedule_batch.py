@@ -646,6 +646,12 @@ class Req(ReqDllmMixin):
         self.host_hit_is_storage = False
         self.storage_prefetch_retry_attempts = 0
         self.staged_prefetch_plan: Optional[StagedPrefetchPlan] = None
+        # Adaptive DP/CP (scheduler_components/adaptive_cp.py): seen for the
+        # arrival rate, examined for the lane, and the lane identity.
+        self.adaptive_cp_seen = False
+        self.adaptive_cp_checked = False
+        self.adaptive_cp_owner: Optional[int] = None
+        self.adaptive_cp_id: Optional[int] = None
         # The tree lock this request holds; None while it runs on a session
         # slot's record or holds no lock.
         self.lock: Optional[TreeLock] = None
@@ -2002,6 +2008,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     dp_balance_stats: Optional[DPBalanceStats] = None
     prefill_stats: Optional[PrefillStats] = None
+    # Adaptive DP/CP: set on a CP step's batch (scheduler_components/adaptive_cp.AdaptiveStep).
+    adaptive_cp: Optional[Any] = None
+    # Whether this batch ran as an adaptive DP/CP CP step (kept after the merge).
+    adaptive_cp_step: bool = False
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False
@@ -3552,6 +3562,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             dp_balance_stats=self.dp_balance_stats,
             prefill_stats=self.prefill_stats,
+            adaptive_cp=self.adaptive_cp,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
