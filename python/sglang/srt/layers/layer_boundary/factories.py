@@ -1007,14 +1007,24 @@ class _Append:
     """One append_stages call: its validated stages, the boundaries it
     returned, which the stack fills in when it closes, and where it was made."""
 
-    __slots__ = ("declarations", "bindings", "prepared_from", "boundaries", "origin")
+    __slots__ = (
+        "declarations",
+        "bindings",
+        "prepared_from",
+        "boundaries",
+        "origin",
+        "redeclare",
+    )
 
-    def __init__(self, declarations, bindings, prepared_from, boundaries, origin):
+    def __init__(
+        self, declarations, bindings, prepared_from, boundaries, origin, redeclare=None
+    ):
         self.declarations = declarations
         self.bindings = bindings
         self.prepared_from = prepared_from
         self.boundaries = boundaries
         self.origin = origin
+        self.redeclare = redeclare
 
 
 class _LayerStack:
@@ -1068,6 +1078,8 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
     try:
         yield stack
         if stack.appends:
+            if _record_stacks:
+                _recorded_stacks.append(_snapshot(stack))
             _bind_stack(
                 stack.appends,
                 previous=_neighbour_stage(stack.previous_layers, last=True),
@@ -1076,6 +1088,62 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
             )
     finally:
         _stack = outer
+
+
+# Adaptive DP/CP binds every stack a second time under the context-parallel
+# topology (see layers/cp/adaptive.py), so the stacks are kept as appended.
+_record_stacks = envs.SGLANG_ADAPTIVE_CP.get()
+_recorded_stacks: list = []
+
+
+def _snapshot(stack):
+    """A stack and, per append, its declarations and returned boundaries'
+    declarations as they were before binding replaced them."""
+    return stack, [
+        (append, list(append.declarations), [b.declaration for b in append.boundaries])
+        for append in stack.appends
+    ]
+
+
+def bind_recorded_stacks():
+    """Bind every recorded stack again under the current parallel topology.
+
+    Returns (boundary, plan, declaration) for every boundary as the new binding
+    made it, and leaves every boundary with the plan and declaration it had.
+    """
+    bound = []
+    for stack, appends in _recorded_stacks:
+        kept = [
+            (b, b.plan, b.declaration, append, list(append.declarations))
+            for append in stack.appends
+            for b in append.boundaries
+        ]
+        for append, declarations, returned in appends:
+            if append.redeclare is not None:
+                # Declarations carry topology-dependent row tables.
+                declarations = [replace(d) for d in append.redeclare()]
+                returned = declarations
+            append.declarations[:] = declarations
+            for boundary, declaration in zip(append.boundaries, returned):
+                boundary.declaration = declaration
+        try:
+            _bind_stack(
+                stack.appends,
+                previous=_neighbour_stage(stack.previous_layers, last=True),
+                following=_neighbour_stage(stack.next_layers, last=False),
+                final_read=stack.final_read,
+            )
+            bound.extend(
+                (b, b.plan, b.declaration)
+                for append in stack.appends
+                for b in append.boundaries
+            )
+        finally:
+            for boundary, plan, declaration, append, declarations in kept:
+                boundary.plan = plan
+                boundary.declaration = declaration
+                append.declarations[:] = declarations
+    return bound
 
 
 def check_declared_stages(stack, appended: int, expected, where: str) -> None:
@@ -1440,7 +1508,7 @@ def _origin(stack: _LayerStack) -> str:
     )
 
 
-def append_stages(*stages, prepared_from=None):
+def append_stages(*stages, prepared_from=None, redeclare=None):
     """Append a local linear sequence of stages to the open layer stack.
 
     Args:
@@ -1452,6 +1520,9 @@ def append_stages(*stages, prepared_from=None):
             branches from. A branch is a side path the model merges back
             explicitly: it neither extends the stack nor waits for a consumer,
             so each of its stages binds with only the stages of the branch.
+        redeclare: Optional callable returning the same stages' declarations
+            again, for binding the stack a second time under another topology
+            (see bind_recorded_stacks).
 
     Returns:
         A tuple of StageBoundary objects in declaration order. Their
@@ -1465,6 +1536,13 @@ def append_stages(*stages, prepared_from=None):
     declarations = [replace(d) for d in declarations]
     boundaries = tuple(StageBoundary(None, declaration=d) for d in declarations)
     stack.appends.append(
-        _Append(declarations, bindings, prepared_from, boundaries, _origin(stack))
+        _Append(
+            declarations,
+            bindings,
+            prepared_from,
+            boundaries,
+            _origin(stack),
+            redeclare,
+        )
     )
     return boundaries

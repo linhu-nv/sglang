@@ -3706,6 +3706,9 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         self.attn_boundary, self.ffn_boundary = append_stages(
             (declarations[0], self.input_layernorm),
             (declarations[1], self.post_attention_layernorm),
+            redeclare=functools.partial(
+                hc_boundary.stages, self.config, self.layer_id, layer=self
+            ),
         )
 
     def _run_boundary_attention(
