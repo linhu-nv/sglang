@@ -2010,8 +2010,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
     # Adaptive DP/CP: set on a CP step's batch (scheduler_components/adaptive_cp.AdaptiveStep).
     adaptive_cp: Optional[Any] = None
-    # Whether this batch ran as an adaptive DP/CP CP step (kept after the merge).
-    adaptive_cp_step: bool = False
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False

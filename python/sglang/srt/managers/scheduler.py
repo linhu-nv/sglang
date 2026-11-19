@@ -2337,10 +2337,6 @@ class Scheduler(
             if last_batch_is_extend:
                 return True
 
-        # A CP step's result goes first, so its next chunk is built after it.
-        if last_batch.adaptive_cp_step:
-            return True
-
         # The next batch's grammar bitmask needs this result's FSM advance.
         return last_batch.grammar_needs_sync()
 

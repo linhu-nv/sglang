@@ -135,6 +135,17 @@ class TestDecide(CustomTestCase):
         self.assertEqual([it.owner for it in plan.items], [1, 0])
         self.assertEqual(sum(it.take for it in plan.items), 60000)
 
+    def test_only_the_last_item_is_cut(self):
+        """The scheduler marks the one cut item as the batch's chunked request, so
+        its result never commits even when the next chunk is built first."""
+        rows = [_row(lane=[_lane(1, 30000, wait_ms=900)])]
+        rows += [_row(lane=[_lane(1, 50000, wait_ms=800)])]
+        rows += [_row(lane=[_lane(1, 20000, wait_ms=700)])]
+        rows += [_row() for _ in range(5)]
+        items = _plan(rows, pol.PolicyConfig(force="cp")).items
+        self.assertEqual([it.last for it in items], [True, False])
+        self.assertEqual(sum(it.take for it in items), CFG.cp_chunk)
+
     def test_force_dp_releases(self):
         rows = [_row(lane=[_lane(1, 30000)])] + [_row() for _ in range(7)]
         plan = _plan(rows, pol.PolicyConfig(force="dp"))

@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 ARRIVAL_WINDOW_S = 30.0
 
 
+
 class _Owned(msgspec.Struct):
     """A lane request this rank owns."""
 
@@ -290,12 +291,17 @@ class AdaptiveCPController:
         plan = policy.decide(views, self.cfg, self.model, self.cp_streak)
         self.cp_streak = self.cp_streak + 1 if plan.is_cp else 0
         if plan.is_cp or plan.release or plan.drop:
+            waits = {e.key: e.wait_ms for v in views for e in v.lane}
             logger.info(
-                "adaptive DP/CP plan %s items=%s release=%s drop=%s",
+                "adaptive DP/CP plan %s items=%s release=%s drop=%s waits=%s rates=%.0f/%.0f",
                 plan.reason,
                 [(it.owner, it.cp_id, it.start, it.take) for it in plan.items],
                 plan.release,
                 plan.drop,
+                [waits.get(it.key, -1) for it in plan.items if it.first]
+                + [waits.get(k, -1) for k in plan.release],
+                plan.cost_cp,
+                plan.cost_dp,
             )
         self.last_plan_reason = plan.reason
         now = time.monotonic()
@@ -423,6 +429,10 @@ class AdaptiveCPController:
             req.extend_end = item.start + item.take
             reqs.append(req)
         move(launched, s.prefill_launched_reqs)
+        # At most one item, the last, is cut. Its row is a middle chunk to the
+        # result processor even if the next chunk is built before it runs.
+        middle = [r for r, it in zip(reqs, plan.items) if not it.last]
+        assert len(middle) <= 1, plan
         batch = ScheduleBatch.init_new(
             reqs,
             s.req_to_token_pool,
@@ -431,13 +441,13 @@ class AdaptiveCPController:
             s.model_config,
             s.enable_overlap,
             s.spec_algorithm,
+            chunked_req=middle[0] if middle else None,
         )
         batch.prepare_for_extend()
         if s.tp_worker.model_runner.prefill_aware_swa:
             for req in reqs:
                 req.kv.shield_window_prefill(req.extend_end)
         self._check_agreement(plan, batch)
-        batch.adaptive_cp_step = True
         batch.adaptive_cp = AdaptiveStep(
             items=list(plan.items),
             unmergeable=unmergeable,
