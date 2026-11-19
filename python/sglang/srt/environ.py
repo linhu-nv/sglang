@@ -799,6 +799,26 @@ class Envs:
     SGLANG_DP_PULL_MAX_SENT = EnvInt(4)
     # Late binding: a rank takes no more requests while this many are waiting on it; 0 = no cap.
     SGLANG_DP_PULL_MAX_WAITING = EnvInt(0)
+    # Adaptive DP/CP: an attention-DP prefill worker runs some steps as one
+    # context-parallel step over all its ranks (see layers/cp/adaptive.py).
+    SGLANG_ADAPTIVE_CP = EnvBool(False)
+    # Requests at least this long and fully uncached may run as CP steps.
+    SGLANG_ADAPTIVE_CP_MIN_TOKENS = EnvInt(16384)
+    # Tokens of one CP step.
+    SGLANG_ADAPTIVE_CP_CHUNK = EnvInt(65536)
+    # A lane request the policy keeps on DP this long goes back to its rank's queue.
+    SGLANG_ADAPTIVE_CP_MAX_WAIT_S = EnvFloat(4.0)
+    SGLANG_ADAPTIVE_CP_MARGIN = EnvFloat(0.02)
+    # "rate": CP when its token rate >= alpha x the DP step's; "lat": simulated latency sums.
+    SGLANG_ADAPTIVE_CP_RULE = EnvStr("rate")
+    SGLANG_ADAPTIVE_CP_ALPHA = EnvFloat(1.0)
+    SGLANG_ADAPTIVE_CP_SWITCH_S = EnvFloat(0.02)
+    # Step-time models, JSON {"dp": {c, b, a, d}, "cp": {c, b, a}}; empty = built-in H20 DSv4.1 fit.
+    SGLANG_ADAPTIVE_CP_MODEL = EnvStr("")
+    # Test modes: "cp" runs every lane request as CP as soon as memory allows, "dp" never.
+    SGLANG_ADAPTIVE_CP_FORCE = EnvStr("")
+    # A CP step may evict at most this fraction of a rank's KV pool from its radix cache.
+    SGLANG_ADAPTIVE_CP_EVICT_FRAC = EnvFloat(0.05)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
