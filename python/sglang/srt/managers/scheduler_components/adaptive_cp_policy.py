@@ -33,6 +33,7 @@ HEADER = (
     "arrival_tokens",
     "arrival_len",
     "window_free",
+    "running",
 )
 ROW_WIDTH = len(HEADER) + 2 * K_DP + LANE_FIELDS * K_LANE
 # Lane entry flags.
@@ -106,6 +107,8 @@ class PolicyConfig(msgspec.Struct, frozen=True):
     window_margin: int = 4096
     # No CP step smaller than this (the window pool would make it a DP-sized chunk).
     min_cp_chunk: int = 8192
+    # Consecutive CP steps after which one DP step runs if any rank has DP work.
+    max_cp_burst: int = 4
     # Simulated DP steps per schedule; beyond it the remaining work is charged at
     # the horizon (both schedules alike).
     horizon_steps: int = 256
@@ -144,6 +147,8 @@ class RankView(msgspec.Struct, frozen=True):
     # Free sliding-window KV tokens (a prefill chunk's transient footprint);
     # negative when the pool has no window partition.
     window_free: int = -1
+    # Requests decoding on the rank (DP work a CP step also pauses).
+    running: int = 0
 
 
 class CPItem(msgspec.Struct, frozen=True):
@@ -197,6 +202,7 @@ def encode_row(
     arrival_tokens: int = 0,
     arrival_len: int = 0,
     window_free: int = -1,
+    running: int = 0,
 ) -> List[int]:
     """``lane`` items: (cp_id, length, done, wait_ms, flags), oldest first."""
     dp = list(dp)[:K_DP]
@@ -212,6 +218,7 @@ def encode_row(
         arrival_tokens,
         arrival_len,
         window_free,
+        running,
     ]
     for rem, length in dp:
         row += [rem, length]
@@ -238,6 +245,7 @@ def decode_rows(rows: Sequence[Sequence[int]]) -> List[RankView]:
             arrival_tokens,
             arrival_len,
             window_free,
+            running,
         ) = row[: len(HEADER)]
         off = len(HEADER)
         dp = [(int(row[off + 2 * i]), int(row[off + 2 * i + 1])) for i in range(n_dp)]
@@ -271,6 +279,7 @@ def decode_rows(rows: Sequence[Sequence[int]]) -> List[RankView]:
                 arrival_tokens=int(arrival_tokens),
                 arrival_len=int(arrival_len),
                 window_free=int(window_free),
+                running=int(running),
             )
         )
     return views
@@ -500,14 +509,24 @@ def _shrink_to_fit(items, views, cfg) -> List[CPItem]:
 
 
 def decide(
-    views: Sequence[RankView], cfg: PolicyConfig, model: StepModel
+    views: Sequence[RankView],
+    cfg: PolicyConfig,
+    model: StepModel,
+    cp_streak: int = 0,
 ) -> Plan:
+    """``cp_streak``: CP steps run back to back right before this one."""
     lane = _lane_order(views)
     cap = step_cap(views, cfg)
     drop = [e.key for e in lane if e.started and not e.alive]
     lane = [e for e in lane if e.alive]
     started = [e for e in lane if e.started]
     waiting = [e for e in lane if not e.started]
+
+    dp_work = any(v.dp or v.tail_count or v.running for v in views)
+    # Decoding requests get a DP step after every CP step.
+    burst = 1 if any(v.running for v in views) else cfg.max_cp_burst
+    if cp_streak >= burst and dp_work and cfg.force != "cp":
+        return Plan(drop=drop, reason="yield")
 
     if started:
         # A started request runs its chunks back to back; fresh requests may

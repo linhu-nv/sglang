@@ -12,7 +12,7 @@ CFG = pol.PolicyConfig()
 MODEL = pol.StepModel()
 
 
-def _row(dp=(), lane=(), free=10**7, rows=64, window=-1):
+def _row(dp=(), lane=(), free=10**7, rows=64, window=-1, running=0):
     dp = list(dp)
     return pol.encode_row(
         dp=dp[: pol.K_DP],
@@ -22,6 +22,7 @@ def _row(dp=(), lane=(), free=10**7, rows=64, window=-1):
         free_rows=rows,
         lane=lane,
         window_free=window,
+        running=running,
     )
 
 
@@ -91,6 +92,19 @@ class TestDecide(CustomTestCase):
         (item,) = plan.items
         self.assertEqual((item.start, item.take), (65536, 100000 - 65536))
         self.assertTrue(item.last)
+
+    def test_cp_burst_yields_one_dp_step(self):
+        """A long started request must not starve DP work: after max_cp_burst CP
+        steps one DP step runs, then the request continues."""
+        rows = [_row(lane=[_lane(1, 400000, done=65536, started=True)])]
+        rows += [_row(dp=[(2000, 30000)]) for _ in range(7)]
+        views = pol.decode_rows(rows)
+        self.assertTrue(pol.decide(views, CFG, MODEL, cp_streak=CFG.max_cp_burst - 1).is_cp)
+        self.assertEqual(pol.decide(views, CFG, MODEL, cp_streak=CFG.max_cp_burst).reason, "yield")
+        idle = pol.decode_rows([rows[0]] + [_row() for _ in range(7)])
+        self.assertTrue(pol.decide(idle, CFG, MODEL, cp_streak=CFG.max_cp_burst).is_cp)
+        decoding = pol.decode_rows([rows[0]] + [_row(running=3)] + [_row() for _ in range(6)])
+        self.assertEqual(pol.decide(decoding, CFG, MODEL, cp_streak=1).reason, "yield")
 
     def test_aborted_started_request_is_dropped_everywhere(self):
         rows = [_row(lane=[_lane(3, 100000, done=65536, started=True, alive=False)])]
