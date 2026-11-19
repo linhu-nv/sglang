@@ -816,6 +816,8 @@ class Envs:
     SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS = EnvBool(False)
     # CP steps in a row before one DP step when any rank has DP work (1 when one decodes).
     SGLANG_ADAPTIVE_CP_MAX_BURST = EnvInt(4)
+    # Release a lane request whose predicted DP finish beats its CP finish behind the lane.
+    SGLANG_ADAPTIVE_CP_RELEASE_ETA = EnvBool(True)
     SGLANG_ADAPTIVE_CP_SWITCH_S = EnvFloat(0.02)
     # Step-time models, JSON {"dp": {c, b, a, d}, "cp": {c, b, a}}; empty = built-in H20 DSv4.1 fit.
     SGLANG_ADAPTIVE_CP_MODEL = EnvStr("")

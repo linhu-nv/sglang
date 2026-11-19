@@ -112,6 +112,10 @@ class PolicyConfig(msgspec.Struct, frozen=True):
     # Release lane requests past max_wait also while CP steps run other requests
     # (otherwise only a DP decision releases them).
     release_always: bool = False
+    # Release a waiting lane request (after min_wait_s) whose predicted DP finish on
+    # its owner is earlier than its predicted CP finish behind the lane ahead of it.
+    release_eta: bool = True
+    min_wait_s: float = 1.0
     # Simulated DP steps per schedule; beyond it the remaining work is charged at
     # the horizon (both schedules alike).
     horizon_steps: int = 256
@@ -519,9 +523,16 @@ def decide(
 ) -> Plan:
     """``cp_streak``: CP steps run back to back right before this one."""
     plan = _decide(views, cfg, model, cp_streak)
-    if not cfg.release_always or cfg.force:
+    if cfg.force:
         return plan
     taken = {it.key for it in plan.items} | set(plan.release) | set(plan.drop)
+    if cfg.release_eta:
+        late = _eta_releases(views, cfg, model, taken)
+        if late:
+            plan = msgspec.structs.replace(plan, release=sorted(plan.release + late))
+            taken |= set(late)
+    if not cfg.release_always:
+        return plan
     stale = [
         e.key
         for v in views
@@ -534,6 +545,35 @@ def decide(
     if not stale:
         return plan
     return msgspec.structs.replace(plan, release=sorted(plan.release + stale))
+
+
+def _eta_releases(views, cfg, model, taken) -> List[Tuple[int, int]]:
+    """Waiting lane requests that would finish earlier on their owner's DP queue
+    than behind the lane requests ahead of them in CP steps."""
+    cap = step_cap(views, cfg) or cfg.min_cp_chunk
+    qs, lens = _next_dp_step(views, [], cfg)
+    ahead = 0
+    out = []
+    for e in _lane_order(views):
+        if not e.alive:
+            continue
+        rem = e.length - e.done
+        ahead += rem
+        if e.started or e.key in taken or e.wait_ms < cfg.min_wait_s * 1000:
+            continue
+        steps = -(-ahead // cap)
+        cp_eta = steps * (model.cp_c + model.cp_e) + model.cp_b * ahead
+        owner = views[e.owner]
+        queued = sum(r for r, _ in owner.dp) + owner.tail_tokens + rem
+        dp_qs = list(qs)
+        dp_qs[e.owner] = cfg.dp_chunk
+        dp_lens = list(lens)
+        dp_lens[e.owner] = max(dp_lens[e.owner], e.length)
+        dp_eta = -(-queued // cfg.dp_chunk) * model.dp_time(dp_qs, dp_lens)
+        if dp_eta < cp_eta:
+            out.append(e.key)
+            ahead -= rem
+    return out
 
 
 def _decide(
@@ -654,6 +694,7 @@ def config_from_env() -> Tuple[PolicyConfig, StepModel]:
         alpha=envs.SGLANG_ADAPTIVE_CP_ALPHA.get(),
         release_always=envs.SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS.get(),
         max_cp_burst=envs.SGLANG_ADAPTIVE_CP_MAX_BURST.get(),
+        release_eta=envs.SGLANG_ADAPTIVE_CP_RELEASE_ETA.get(),
     )
     path: Optional[str] = envs.SGLANG_ADAPTIVE_CP_MODEL.get() or None
     model = StepModel.from_json(path) if path else StepModel()

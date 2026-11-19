@@ -146,6 +146,20 @@ class TestDecide(CustomTestCase):
         self.assertEqual([it.last for it in items], [True, False])
         self.assertEqual(sum(it.take for it in items), CFG.cp_chunk)
 
+    def test_eta_release_of_a_request_deep_in_the_lane(self):
+        """A lane request behind a lot of CP work goes to DP when its idle owner
+        would finish it first; the head of the lane keeps its CP step."""
+        rows = [_row(lane=[_lane(1, 200000, wait_ms=9000)])]
+        rows += [_row(lane=[_lane(1, 200000, wait_ms=8000)])]
+        rows += [_row(lane=[_lane(1, 20000, wait_ms=7000)])]
+        rows += [_row() for _ in range(5)]
+        plan = _plan(rows)
+        self.assertTrue(plan.is_cp)
+        self.assertEqual(plan.items[0].owner, 0)
+        self.assertIn((2, 1), plan.release)
+        no_eta = _plan(rows, pol.PolicyConfig(release_eta=False))
+        self.assertNotIn((2, 1), no_eta.release)
+
     def test_force_dp_releases(self):
         rows = [_row(lane=[_lane(1, 30000)])] + [_row() for _ in range(7)]
         plan = _plan(rows, pol.PolicyConfig(force="dp"))
