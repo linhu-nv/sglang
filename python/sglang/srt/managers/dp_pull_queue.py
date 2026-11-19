@@ -6,9 +6,11 @@ uneven prefill times, some ranks then sit idle in lockstep steps while others
 still have queued work. Here requests wait at the DP controller instead, and a
 rank receives the next one only once its queued prefill work (uncached tokens
 waiting or left in its chunked request, as its scheduler reports after every
-prefill step, plus what the controller sent it since) falls below a budget of
-about one step. A busy rank thus keeps one step of work queued and the rest of
-the requests go to whichever rank frees up first.
+prefill step) falls below a budget of about one step, and at most `max_sent`
+requests go to a rank between two of its snapshots (the controller does not know
+a request's prefix hit, so it cannot size it; the scheduler's next snapshot does).
+A busy rank thus keeps about one step of work queued and the rest of the requests
+go to whichever rank frees up first.
 """
 
 from __future__ import annotations
@@ -23,9 +25,10 @@ _SNAPSHOT_SLACK_S = 0.05
 
 
 class DPPullQueue:
-    def __init__(self, num_ranks: int, budget_tokens: int, clock: Callable[[], float] = time.time):
+    def __init__(self, num_ranks: int, budget_tokens: int, max_sent: int = 4, clock: Callable[[], float] = time.time):
         self.num_ranks = num_ranks
         self.budget_tokens = budget_tokens
+        self.max_sent = max_sent
         self.clock = clock          # same clock as LoadSnapshot.timestamp
         self.held: collections.deque = collections.deque()   # (req, prompt_tokens, enqueue time)
         self.snap_tokens = [0] * num_ranks
@@ -60,15 +63,15 @@ class DPPullQueue:
 
     def pop_ready(self, active_ranks: List[int]) -> List[Tuple[Any, int]]:
         """Requests to send now, in arrival order, each to the least-loaded active rank whose
-        queued work is below the budget (an empty rank always takes one)."""
+        reported queued work is below the budget and that has not been sent `max_sent` since."""
         out = []
-        if not active_ranks:
-            return out
         now = self.clock()
         while self.held:
-            rank = min(active_ranks, key=lambda r: (self.load(r), len(self.sent[r])))
-            if self.load(rank) >= self.budget_tokens:
+            open_ranks = [r for r in active_ranks
+                          if self.snap_tokens[r] < self.budget_tokens and len(self.sent[r]) < self.max_sent]
+            if not open_ranks:
                 break
+            rank = min(open_ranks, key=lambda r: (self.load(r), len(self.sent[r])))
             req, prompt_tokens, _ = self.held.popleft()
             self.sent[rank].append((now, self.estimate(prompt_tokens, rank)))
             out.append((req, rank))

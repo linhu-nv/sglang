@@ -25,9 +25,9 @@ def _snap(rank, ts, tokens, hit=0.0):
 class TestDPPullQueue(CustomTestCase):
     def setUp(self):
         self.clock = _Clock()
-        self.q = DPPullQueue(num_ranks=2, budget_tokens=8192, clock=self.clock)
+        self.q = DPPullQueue(num_ranks=2, budget_tokens=8192, max_sent=4, clock=self.clock)
 
-    def test_holds_until_a_rank_has_room(self):
+    def test_holds_until_a_rank_reports_room(self):
         self.q.update([_snap(0, 99.0, 20000), _snap(1, 99.0, 9000)])
         self.q.push("a", prompt_tokens=1000)
         self.assertEqual(self.q.pop_ready([0, 1]), [])
@@ -35,20 +35,24 @@ class TestDPPullQueue(CustomTestCase):
         self.q.update([_snap(1, 100.5, 0)])
         self.assertEqual(self.q.pop_ready([0, 1]), [("a", 1)])
 
-    def test_sent_work_counts_until_a_later_snapshot(self):
+    def test_at_most_max_sent_per_rank_between_snapshots(self):
         self.q.update([_snap(0, 99.0, 0), _snap(1, 99.0, 0)])
-        for name in "abc":
-            self.q.push(name, prompt_tokens=6000)
-        # Each rank takes requests while its queued work is below the budget.
+        for i in range(10):
+            self.q.push(i, prompt_tokens=500)
         out = self.q.pop_ready([0, 1])
-        self.assertEqual([r for _, r in out], [0, 1, 0])
-        self.assertEqual(self.q.load(0), 12000)
-        self.q.push("d", prompt_tokens=100)
-        self.assertEqual(self.q.pop_ready([0, 1]), [("d", 1)])
-        # A snapshot taken after the sends replaces them.
+        self.assertEqual(sorted(r for _, r in out), [0, 0, 0, 0, 1, 1, 1, 1])
+        self.assertEqual(len(self.q), 2)
         self.clock.t = 101.0
-        self.q.update([_snap(0, 101.0, 500)])
-        self.assertEqual(self.q.load(0), 500)
+        self.q.update([_snap(0, 101.0, 2000)])   # rank 0 took them in; its next step has room
+        self.assertEqual([r for _, r in self.q.pop_ready([0, 1])], [0, 0])
+
+    def test_big_request_steers_the_next_ones_elsewhere(self):
+        self.q.update([_snap(0, 99.0, 0, hit=0.5), _snap(1, 99.0, 0, hit=0.5)])
+        self.q.push("big", prompt_tokens=100000)
+        self.q.push("s1", prompt_tokens=1000)
+        self.q.push("s2", prompt_tokens=1000)
+        self.assertEqual(self.q.pop_ready([0, 1]), [("big", 0), ("s1", 1), ("s2", 1)])
+        self.assertEqual(self.q.load(0), 50000)
 
     def test_sends_just_before_a_snapshot_stay_counted(self):
         self.q.update([_snap(0, 99.0, 0), _snap(1, 99.0, 9000)])
@@ -57,21 +61,14 @@ class TestDPPullQueue(CustomTestCase):
         self.q.update([_snap(0, 100.01, 0)])   # may predate the scheduler receiving "a"
         self.assertEqual(self.q.load(0), 5000)
 
-    def test_estimate_uses_hit_rate_and_inactive_ranks_are_skipped(self):
-        self.q.update([_snap(0, 99.0, 0, hit=0.9), _snap(1, 99.0, 0)])
-        self.q.push("a", prompt_tokens=10000)
-        self.assertEqual(self.q.pop_ready([0]), [("a", 0)])
-        self.assertEqual(self.q.load(0), 1000)
-        self.assertEqual(self.q.load(1), 0)
-
-    def test_stale_snapshot_ignored_and_abort_removes(self):
-        self.q.update([_snap(0, 99.0, 9000), _snap(1, 99.0, 9000)])
-        self.q.update([_snap(0, 98.0, 0)])
-        self.assertEqual(self.q.load(0), 9000)
+    def test_inactive_ranks_skipped_stale_snapshot_ignored_abort_removes(self):
+        self.q.update([_snap(0, 99.0, 0), _snap(1, 99.0, 0)])
+        self.q.update([_snap(0, 98.0, 9000)])
+        self.assertEqual(self.q.load(0), 0)
         self.q.push("a", 10)
         self.q.push("b", 10)
         self.assertEqual(self.q.remove(lambda r: r == "a"), ["a"])
-        self.assertEqual(len(self.q), 1)
+        self.assertEqual(self.q.pop_ready([1]), [("b", 1)])
 
 
 if __name__ == "__main__":

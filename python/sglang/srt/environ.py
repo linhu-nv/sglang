@@ -795,6 +795,8 @@ class Envs:
     # Attention-DP late binding: hold requests at the DP controller and send one to a
     # rank only when that rank's queued prefill work is below this many tokens; 0 = off.
     SGLANG_DP_PULL_TOKENS = EnvInt(0)
+    # Late binding: at most this many requests go to a rank between two of its load snapshots.
+    SGLANG_DP_PULL_MAX_SENT = EnvInt(4)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)

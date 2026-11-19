@@ -230,7 +230,11 @@ class DataParallelController:
         self._last_refresh_time = 0.0
         pull_tokens = envs.SGLANG_DP_PULL_TOKENS.get()
         self.pull_queue: DPPullQueue | None = (
-            DPPullQueue(get_parallel().num_dp_ranks, budget_tokens=pull_tokens)
+            DPPullQueue(
+                get_parallel().num_dp_ranks,
+                budget_tokens=pull_tokens,
+                max_sent=envs.SGLANG_DP_PULL_MAX_SENT.get(),
+            )
             if pull_tokens > 0 and get_parallel().num_dp_ranks > 1
             else None
         )
