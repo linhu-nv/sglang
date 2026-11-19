@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.kv_hints import uncached_tokens_hint
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
     LoadSnapshot,
@@ -103,6 +104,8 @@ class SchedulerLoadInquirer:
                             0, min(span[1], req.seqlen) - max(span[0], matched)
                         )
                         uncached -= storage_tokens
+            elif (hint := uncached_tokens_hint(req.kv_hints)) is not None:
+                uncached = min(hint, req.seqlen)
             else:
                 # The historical hit rate already includes admitted storage hits.
                 uncached = int(req.seqlen * cache_miss_rate)

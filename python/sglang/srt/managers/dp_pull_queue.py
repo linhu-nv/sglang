@@ -35,7 +35,7 @@ class DPPullQueue:
         self.max_waiting = max_waiting
         self.snap_waiting = [0] * num_ranks
         self.clock = clock          # same clock as LoadSnapshot.timestamp
-        self.held: collections.deque = collections.deque()   # (req, prompt_tokens, enqueue time)
+        self.held: collections.deque = collections.deque()   # (req, prompt_tokens, uncached hint, enqueue time)
         self.snap_tokens = [0] * num_ranks
         self.snap_ts = [0.0] * num_ranks
         self.sent: List[List[Tuple[float, int]]] = [[] for _ in range(num_ranks)]
@@ -60,12 +60,14 @@ class DPPullQueue:
     def load(self, rank: int) -> int:
         return self.snap_tokens[rank] + sum(n for _, n in self.sent[rank])
 
-    def estimate(self, prompt_tokens: int, rank: int) -> int:
-        # The controller does not know the prefix hit; use the rank's recent hit rate.
+    def estimate(self, prompt_tokens: int, rank: int, uncached: Optional[int] = None) -> int:
+        # Without the orchestrator's hint the controller does not know the prefix hit; use the rank's hit rate.
+        if uncached is not None:
+            return max(1, uncached)
         return max(1, round(prompt_tokens * (1.0 - self.hit_rate[rank])))
 
-    def push(self, req: Any, prompt_tokens: int) -> None:
-        self.held.append((req, prompt_tokens, self.clock()))
+    def push(self, req: Any, prompt_tokens: int, uncached: Optional[int] = None) -> None:
+        self.held.append((req, prompt_tokens, uncached, self.clock()))
 
     def pop_ready(self, active_ranks: List[int]) -> List[Tuple[Any, int]]:
         """Requests to send now, in arrival order, each to the least-loaded active rank whose
@@ -77,8 +79,8 @@ class DPPullQueue:
             if not open_ranks:
                 break
             rank = min(open_ranks, key=lambda r: (self.load(r), len(self.sent[r])))
-            req, prompt_tokens, _ = self.held.popleft()
-            self.sent[rank].append((now, self.estimate(prompt_tokens, rank)))
+            req, prompt_tokens, uncached, _ = self.held.popleft()
+            self.sent[rank].append((now, self.estimate(prompt_tokens, rank, uncached)))
             out.append((req, rank))
         return out
 
@@ -96,4 +98,4 @@ class DPPullQueue:
         return [item[0] for item in dropped]
 
     def oldest_wait(self) -> Optional[float]:
-        return self.clock() - self.held[0][2] if self.held else None
+        return self.clock() - self.held[0][3] if self.held else None

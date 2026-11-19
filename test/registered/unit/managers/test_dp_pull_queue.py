@@ -79,6 +79,12 @@ class TestDPPullQueue(CustomTestCase):
         self.assertEqual(q.pop_ready([0, 1]), [(0, 1)])
         self.assertEqual(len(q), 2)
 
+    def test_uncached_hint_replaces_the_hit_rate_estimate(self):
+        self.q.update([_snap(0, 99.0, 0, hit=0.0), _snap(1, 99.0, 0, hit=0.0)])
+        self.q.push("a", prompt_tokens=100000, uncached=1200)
+        self.q.pop_ready([0, 1])
+        self.assertEqual(self.q.load(0), 1200)
+
 
 if __name__ == "__main__":
     unittest.main()

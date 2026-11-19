@@ -53,6 +53,7 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.dp_pull_queue import DPPullQueue
+from sglang.srt.managers.kv_hints import uncached_tokens_hint
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -381,7 +382,11 @@ class DataParallelController:
             self.dispatch_health_check(req)
         elif self.pull_queue is not None and req.routed_dp_rank is None:
             # Held as is (time_stats still wrapped for IPC) until a rank has room.
-            self.pull_queue.push(req, prompt_tokens=self._prompt_tokens(req))
+            self.pull_queue.push(
+                req,
+                prompt_tokens=self._prompt_tokens(req),
+                uncached=uncached_tokens_hint(req.kv_hints),
+            )
             self._pump_pull_queue()
             return
         else:
