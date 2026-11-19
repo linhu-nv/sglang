@@ -819,6 +819,23 @@ class SchedulerMetricsReporter:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+        # The load snapshot (DP balancing, /v1/loads) reads the hit rates with or
+        # without --enable-metrics.
+        effective_input_tokens = (
+            prefill_stats.log_input_tokens - prefill_stats.reprocessed_log_input_tokens
+        )
+        effective_hit_tokens = (
+            prefill_stats.log_hit_tokens - prefill_stats.reprocessed_log_hit_tokens
+        )
+        total_tokens = effective_input_tokens + effective_hit_tokens
+        self.stats.cache_hit_rate = (
+            effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+        )
+        self.recent_cache_hit_rate = self.cache_hit_rate_window.add(
+            effective_hit_tokens,
+            total_tokens,
+            now,
+        )
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -839,22 +856,6 @@ class SchedulerMetricsReporter:
                 )
 
             priority_enabled = self.scheduler.enable_priority_scheduling
-            effective_input_tokens = (
-                prefill_stats.log_input_tokens
-                - prefill_stats.reprocessed_log_input_tokens
-            )
-            effective_hit_tokens = (
-                prefill_stats.log_hit_tokens - prefill_stats.reprocessed_log_hit_tokens
-            )
-            total_tokens = effective_input_tokens + effective_hit_tokens
-            cache_hit_rate = (
-                effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
-            )
-            self.recent_cache_hit_rate = self.cache_hit_rate_window.add(
-                effective_hit_tokens,
-                total_tokens,
-                now,
-            )
             self.metrics_collector.increment_effective_prefill_tokens(
                 input_tokens=effective_input_tokens,
                 device_hit_tokens=prefill_stats.log_device_hit_tokens,
@@ -875,7 +876,6 @@ class SchedulerMetricsReporter:
             else:
                 self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self._update_queue_stats(priority_enabled)
-            self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
             # decode-stats ticks, and the gauge must decay rather than hold.
             self.stats.gen_throughput = self._current_gen_throughput(now)
