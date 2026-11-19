@@ -814,6 +814,8 @@ class Envs:
     SGLANG_ADAPTIVE_CP_ALPHA = EnvFloat(1.0)
     # Release lane requests past max_wait even while CP steps run other requests.
     SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS = EnvBool(False)
+    # CP steps in a row before one DP step when any rank has DP work (1 when one decodes).
+    SGLANG_ADAPTIVE_CP_MAX_BURST = EnvInt(4)
     SGLANG_ADAPTIVE_CP_SWITCH_S = EnvFloat(0.02)
     # Step-time models, JSON {"dp": {c, b, a, d}, "cp": {c, b, a}}; empty = built-in H20 DSv4.1 fit.
     SGLANG_ADAPTIVE_CP_MODEL = EnvStr("")

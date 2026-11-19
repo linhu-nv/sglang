@@ -653,6 +653,7 @@ def config_from_env() -> Tuple[PolicyConfig, StepModel]:
         rule=envs.SGLANG_ADAPTIVE_CP_RULE.get(),
         alpha=envs.SGLANG_ADAPTIVE_CP_ALPHA.get(),
         release_always=envs.SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS.get(),
+        max_cp_burst=envs.SGLANG_ADAPTIVE_CP_MAX_BURST.get(),
     )
     path: Optional[str] = envs.SGLANG_ADAPTIVE_CP_MODEL.get() or None
     model = StepModel.from_json(path) if path else StepModel()
