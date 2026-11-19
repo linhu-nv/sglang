@@ -234,6 +234,7 @@ class DataParallelController:
                 get_parallel().num_dp_ranks,
                 budget_tokens=pull_tokens,
                 max_sent=envs.SGLANG_DP_PULL_MAX_SENT.get(),
+                max_waiting=envs.SGLANG_DP_PULL_MAX_WAITING.get(),
             )
             if pull_tokens > 0 and get_parallel().num_dp_ranks > 1
             else None

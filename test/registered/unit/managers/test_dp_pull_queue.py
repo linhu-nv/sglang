@@ -18,8 +18,9 @@ class _Clock:
         return self.t
 
 
-def _snap(rank, ts, tokens, hit=0.0):
-    return LoadSnapshot(dp_rank=rank, timestamp=ts, num_waiting_uncached_tokens=tokens, cache_hit_rate=hit)
+def _snap(rank, ts, tokens, hit=0.0, waiting=0):
+    return LoadSnapshot(dp_rank=rank, timestamp=ts, num_waiting_uncached_tokens=tokens, cache_hit_rate=hit,
+                        num_waiting_reqs=waiting)
 
 
 class TestDPPullQueue(CustomTestCase):
@@ -69,6 +70,14 @@ class TestDPPullQueue(CustomTestCase):
         self.q.push("b", 10)
         self.assertEqual(self.q.remove(lambda r: r == "a"), ["a"])
         self.assertEqual(self.q.pop_ready([1]), [("b", 1)])
+
+    def test_waiting_cap_counts_reported_and_sent(self):
+        q = DPPullQueue(num_ranks=2, budget_tokens=10**9, max_sent=4, max_waiting=2, clock=self.clock)
+        q.update([_snap(0, 99.0, 500000, waiting=2), _snap(1, 99.0, 0, waiting=1)])
+        for i in range(3):
+            q.push(i, prompt_tokens=1000)
+        self.assertEqual(q.pop_ready([0, 1]), [(0, 1)])
+        self.assertEqual(len(q), 2)
 
 
 if __name__ == "__main__":

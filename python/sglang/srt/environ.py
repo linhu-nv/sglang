@@ -797,6 +797,8 @@ class Envs:
     SGLANG_DP_PULL_TOKENS = EnvInt(0)
     # Late binding: at most this many requests go to a rank between two of its load snapshots.
     SGLANG_DP_PULL_MAX_SENT = EnvInt(4)
+    # Late binding: a rank takes no more requests while this many are waiting on it; 0 = no cap.
+    SGLANG_DP_PULL_MAX_WAITING = EnvInt(0)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)

@@ -10,7 +10,9 @@ prefill step) falls below a budget of about one step, and at most `max_sent`
 requests go to a rank between two of its snapshots (the controller does not know
 a request's prefix hit, so it cannot size it; the scheduler's next snapshot does).
 A busy rank thus keeps about one step of work queued and the rest of the requests
-go to whichever rank frees up first.
+go to whichever rank frees up first. `max_waiting` > 0 also caps the requests a rank
+has waiting (reported plus sent since): the reported uncached tokens of requests not
+yet prefix-matched come from a recent hit rate and can be several times too high.
 """
 
 from __future__ import annotations
@@ -25,10 +27,13 @@ _SNAPSHOT_SLACK_S = 0.05
 
 
 class DPPullQueue:
-    def __init__(self, num_ranks: int, budget_tokens: int, max_sent: int = 4, clock: Callable[[], float] = time.time):
+    def __init__(self, num_ranks: int, budget_tokens: int, max_sent: int = 4, max_waiting: int = 0,
+                 clock: Callable[[], float] = time.time):
         self.num_ranks = num_ranks
         self.budget_tokens = budget_tokens
         self.max_sent = max_sent
+        self.max_waiting = max_waiting
+        self.snap_waiting = [0] * num_ranks
         self.clock = clock          # same clock as LoadSnapshot.timestamp
         self.held: collections.deque = collections.deque()   # (req, prompt_tokens, enqueue time)
         self.snap_tokens = [0] * num_ranks
@@ -47,6 +52,7 @@ class DPPullQueue:
                 continue
             self.snap_ts[r] = load.timestamp
             self.snap_tokens[r] = load.num_waiting_uncached_tokens
+            self.snap_waiting[r] = load.num_waiting_reqs
             self.hit_rate[r] = min(1.0, max(0.0, load.cache_hit_rate))
             cutoff = load.timestamp - _SNAPSHOT_SLACK_S
             self.sent[r] = [s for s in self.sent[r] if s[0] > cutoff]
@@ -67,8 +73,7 @@ class DPPullQueue:
         out = []
         now = self.clock()
         while self.held:
-            open_ranks = [r for r in active_ranks
-                          if self.snap_tokens[r] < self.budget_tokens and len(self.sent[r]) < self.max_sent]
+            open_ranks = [r for r in active_ranks if self._open(r)]
             if not open_ranks:
                 break
             rank = min(open_ranks, key=lambda r: (self.load(r), len(self.sent[r])))
@@ -76,6 +81,11 @@ class DPPullQueue:
             self.sent[rank].append((now, self.estimate(prompt_tokens, rank)))
             out.append((req, rank))
         return out
+
+    def _open(self, r: int) -> bool:
+        if self.snap_tokens[r] >= self.budget_tokens or len(self.sent[r]) >= self.max_sent:
+            return False
+        return not self.max_waiting or self.snap_waiting[r] + len(self.sent[r]) < self.max_waiting
 
     def remove(self, match: Callable[[Any], bool]) -> List[Any]:
         """Drop held requests matching `match` (e.g. aborted); returns them."""
