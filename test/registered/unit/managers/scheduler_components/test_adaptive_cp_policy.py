@@ -54,7 +54,9 @@ class TestRowCodec(CustomTestCase):
         self.assertEqual((view.free_tokens, view.free_rows), (77, 3))
         self.assertEqual(view.arrival_rate, 1.25)
         (entry,) = view.lane
-        self.assertEqual((entry.owner, entry.cp_id, entry.length, entry.done), (0, 9, 50000, 1000))
+        self.assertEqual(
+            (entry.owner, entry.cp_id, entry.length, entry.done), (0, 9, 50000, 1000)
+        )
         self.assertTrue(entry.started and entry.alive)
 
     def test_caps(self):
@@ -71,12 +73,16 @@ class TestDecide(CustomTestCase):
         plan = _plan(rows)
         self.assertTrue(plan.is_cp)
         (item,) = plan.items
-        self.assertEqual((item.owner, item.cp_id, item.start, item.take), (0, 1, 0, CFG.cp_chunk))
+        self.assertEqual(
+            (item.owner, item.cp_id, item.start, item.take), (0, 1, 0, CFG.cp_chunk)
+        )
         self.assertTrue(item.first and not item.last)
 
     def test_busy_ranks_keep_dp_then_release(self):
         busy = [(8192, 80000)] * 6
-        rows = [_row(dp=busy, lane=[_lane(1, 20000, wait_ms=100)])] + [_row(dp=busy) for _ in range(7)]
+        rows = [_row(dp=busy, lane=[_lane(1, 20000, wait_ms=100)])] + [
+            _row(dp=busy) for _ in range(7)
+        ]
         plan = _plan(rows, pol.PolicyConfig(alpha=2.0))
         self.assertFalse(plan.is_cp)
         self.assertEqual(plan.release, [])
@@ -99,11 +105,17 @@ class TestDecide(CustomTestCase):
         rows = [_row(lane=[_lane(1, 400000, done=65536, started=True)])]
         rows += [_row(dp=[(2000, 30000)]) for _ in range(7)]
         views = pol.decode_rows(rows)
-        self.assertTrue(pol.decide(views, CFG, MODEL, cp_streak=CFG.max_cp_burst - 1).is_cp)
-        self.assertEqual(pol.decide(views, CFG, MODEL, cp_streak=CFG.max_cp_burst).reason, "yield")
+        self.assertTrue(
+            pol.decide(views, CFG, MODEL, cp_streak=CFG.max_cp_burst - 1).is_cp
+        )
+        self.assertEqual(
+            pol.decide(views, CFG, MODEL, cp_streak=CFG.max_cp_burst).reason, "yield"
+        )
         idle = pol.decode_rows([rows[0]] + [_row() for _ in range(7)])
         self.assertTrue(pol.decide(idle, CFG, MODEL, cp_streak=CFG.max_cp_burst).is_cp)
-        decoding = pol.decode_rows([rows[0]] + [_row(running=3)] + [_row() for _ in range(6)])
+        decoding = pol.decode_rows(
+            [rows[0]] + [_row(running=3)] + [_row() for _ in range(6)]
+        )
         self.assertEqual(pol.decide(decoding, CFG, MODEL, cp_streak=1).reason, "yield")
 
     def test_aborted_started_request_is_dropped_everywhere(self):
@@ -121,7 +133,9 @@ class TestDecide(CustomTestCase):
 
     def test_window_pool_bounds_the_chunk(self):
         """A CP chunk's transient sliding-window KV must fit every rank's window pool."""
-        rows = [_row(lane=[_lane(1, 100000)], window=40000)] + [_row(window=60000) for _ in range(7)]
+        rows = [_row(lane=[_lane(1, 100000)], window=40000)] + [
+            _row(window=60000) for _ in range(7)
+        ]
         (item,) = _plan(rows).items
         self.assertEqual(item.take, (40000 - CFG.window_margin) // 256 * 256)
         rows[3] = _row(window=CFG.min_cp_chunk)
@@ -166,7 +180,12 @@ class TestDecide(CustomTestCase):
         self.assertEqual(plan.release, [(0, 1)])
 
     def test_plan_is_deterministic(self):
-        rows = [_row(dp=[(3000, 50000)] * (r % 3), lane=[_lane(r + 1, 40000 + r, wait_ms=r)]) for r in range(8)]
+        rows = [
+            _row(
+                dp=[(3000, 50000)] * (r % 3), lane=[_lane(r + 1, 40000 + r, wait_ms=r)]
+            )
+            for r in range(8)
+        ]
         plans = {repr(_plan([list(x) for x in rows])) for _ in range(5)}
         self.assertEqual(len(plans), 1)
 

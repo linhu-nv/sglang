@@ -84,10 +84,7 @@ class StepModel(msgspec.Struct, frozen=True):
         q = sum(take for _, take in chunks)
         attn = sum(take * (start + take) for start, take in chunks)
         return (
-            self.cp_c
-            + self.cp_b * q
-            + self.cp_a * attn / 1e9
-            + self.cp_e * len(chunks)
+            self.cp_c + self.cp_b * q + self.cp_a * attn / 1e9 + self.cp_e * len(chunks)
         )
 
 
@@ -313,7 +310,11 @@ class _Arrivals:
 
     def __init__(self, views: Sequence[RankView]):
         self.streams = [
-            (1.0 / v.arrival_rate, v.arrival_tokens, max(v.arrival_len, v.arrival_tokens))
+            (
+                1.0 / v.arrival_rate,
+                v.arrival_tokens,
+                max(v.arrival_len, v.arrival_tokens),
+            )
             if v.arrival_rate > 0 and v.arrival_tokens > 0
             else None
             for v in views

@@ -35,8 +35,8 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
-from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.allocation import retire_window
+from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -47,7 +47,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ARRIVAL_WINDOW_S = 30.0
-
 
 
 class _Owned(msgspec.Struct):
@@ -88,9 +87,7 @@ class AdaptiveCPController:
         self.evict_budget = int(
             envs.SGLANG_ADAPTIVE_CP_EVICT_FRAC.get() * scheduler.max_total_num_tokens
         )
-        self.has_window = bool(
-            scheduler.token_to_kv_pool_allocator.window_pool_names()
-        )
+        self.has_window = bool(scheduler.token_to_kv_pool_allocator.window_pool_names())
         self.lane = IndexedReqList(ListKind.ADAPTIVE_CP, abort=self._abort)
         self.owned: Dict[int, _Owned] = {}
         self.replicas: Dict[Tuple[int, int], Req] = {}
@@ -141,8 +138,8 @@ class AdaptiveCPController:
 
     def _eligible(self, req: Req) -> bool:
         # Output-token logprobs are fine; input logprobs would span replicas.
-        input_logprobs = (
-            req.return_logprob and req.logprob_start_len < len(req.origin_input_ids)
+        input_logprobs = req.return_logprob and req.logprob_start_len < len(
+            req.origin_input_ids
         )
         return (
             not input_logprobs
@@ -238,7 +235,9 @@ class AdaptiveCPController:
             dp.append((self._uncached_estimate(req), req.seqlen))
         head, tail = dp[: policy.K_DP], dp[policy.K_DP :]
         lane = []
-        for st in sorted(self.owned.values(), key=lambda x: x.enqueued)[: policy.K_LANE]:
+        for st in sorted(self.owned.values(), key=lambda x: x.enqueued)[
+            : policy.K_LANE
+        ]:
             flags = (policy.FLAG_STARTED if st.started else 0) | (
                 policy.FLAG_ALIVE if st.alive and not st.req.finished() else 0
             )
@@ -251,7 +250,11 @@ class AdaptiveCPController:
                     flags,
                 )
             )
-        span = min(ARRIVAL_WINDOW_S, max(1.0, now - self.arrivals[0][0])) if self.arrivals else 1.0
+        span = (
+            min(ARRIVAL_WINDOW_S, max(1.0, now - self.arrivals[0][0]))
+            if self.arrivals
+            else 1.0
+        )
         n = len(self.arrivals)
         # What admission would see; a CP step may evict at most evict_budget
         # cached tokens, so replicas never push out much of a rank's own prefixes.
@@ -462,7 +465,10 @@ class AdaptiveCPController:
         sig = [
             len(batch.reqs),
             int(batch.extend_num_tokens),
-            sum((it.owner + 1) * 1_000_003 + it.cp_id * 7919 + it.start for it in plan.items)
+            sum(
+                (it.owner + 1) * 1_000_003 + it.cp_id * 7919 + it.start
+                for it in plan.items
+            )
             % (1 << 61),
         ]
         local = torch.tensor(sig, dtype=torch.int64)
@@ -500,7 +506,9 @@ class AdaptiveCPController:
 def maybe_init_adaptive_cp(scheduler: "Scheduler") -> Optional[AdaptiveCPController]:
     if not adaptive_cp_enabled():
         return None
-    scope = get_adaptive_cp() or init_adaptive_cp(scheduler.tp_worker.model_runner.model)
+    scope = get_adaptive_cp() or init_adaptive_cp(
+        scheduler.tp_worker.model_runner.model
+    )
     from sglang.srt.disaggregation.mode import DisaggregationMode
 
     if scheduler.disaggregation_mode != DisaggregationMode.NULL:
