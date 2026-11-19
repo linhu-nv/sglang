@@ -109,6 +109,9 @@ class PolicyConfig(msgspec.Struct, frozen=True):
     min_cp_chunk: int = 8192
     # Consecutive CP steps after which one DP step runs if any rank has DP work.
     max_cp_burst: int = 4
+    # Release lane requests past max_wait also while CP steps run other requests
+    # (otherwise only a DP decision releases them).
+    release_always: bool = False
     # Simulated DP steps per schedule; beyond it the remaining work is charged at
     # the horizon (both schedules alike).
     horizon_steps: int = 256
@@ -515,6 +518,30 @@ def decide(
     cp_streak: int = 0,
 ) -> Plan:
     """``cp_streak``: CP steps run back to back right before this one."""
+    plan = _decide(views, cfg, model, cp_streak)
+    if not cfg.release_always or cfg.force:
+        return plan
+    taken = {it.key for it in plan.items} | set(plan.release) | set(plan.drop)
+    stale = [
+        e.key
+        for v in views
+        for e in v.lane
+        if not e.started
+        and e.alive
+        and e.wait_ms >= cfg.max_wait_s * 1000
+        and e.key not in taken
+    ]
+    if not stale:
+        return plan
+    return msgspec.structs.replace(plan, release=sorted(plan.release + stale))
+
+
+def _decide(
+    views: Sequence[RankView],
+    cfg: PolicyConfig,
+    model: StepModel,
+    cp_streak: int = 0,
+) -> Plan:
     lane = _lane_order(views)
     cap = step_cap(views, cfg)
     drop = [e.key for e in lane if e.started and not e.alive]
@@ -625,6 +652,7 @@ def config_from_env() -> Tuple[PolicyConfig, StepModel]:
         force=envs.SGLANG_ADAPTIVE_CP_FORCE.get(),
         rule=envs.SGLANG_ADAPTIVE_CP_RULE.get(),
         alpha=envs.SGLANG_ADAPTIVE_CP_ALPHA.get(),
+        release_always=envs.SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS.get(),
     )
     path: Optional[str] = envs.SGLANG_ADAPTIVE_CP_MODEL.get() or None
     model = StepModel.from_json(path) if path else StepModel()

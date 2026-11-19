@@ -812,6 +812,8 @@ class Envs:
     # "rate": CP when its token rate >= alpha x the DP step's; "lat": simulated latency sums.
     SGLANG_ADAPTIVE_CP_RULE = EnvStr("rate")
     SGLANG_ADAPTIVE_CP_ALPHA = EnvFloat(1.0)
+    # Release lane requests past max_wait even while CP steps run other requests.
+    SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS = EnvBool(False)
     SGLANG_ADAPTIVE_CP_SWITCH_S = EnvFloat(0.02)
     # Step-time models, JSON {"dp": {c, b, a, d}, "cp": {c, b, a}}; empty = built-in H20 DSv4.1 fit.
     SGLANG_ADAPTIVE_CP_MODEL = EnvStr("")
