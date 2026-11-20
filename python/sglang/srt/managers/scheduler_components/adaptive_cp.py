@@ -431,9 +431,10 @@ class AdaptiveCPController:
 
     def _settle_warm_prefixes(self, plan: policy.Plan) -> policy.Plan:
         """A warm item starts where every rank has the prefix in its own tree: the
-        minimum over ranks of the device match (capped at the owner's prefix). The
-        chunk grows by the cut so it ends where the plan said; ranks lock their
-        prefix nodes for the request's CP chunks."""
+        minimum over ranks of the device match (capped at the owner's prefix). Only
+        the plan's last item may start earlier than planned (it keeps its size and
+        may end up cut); otherwise, or past max_gap, the request runs in DP. Ranks
+        lock their prefix nodes for the request's CP chunks."""
         self._warm_replicas: Dict[Tuple[int, int], Req] = {}
         warm = [it for it in plan.items if it.first and it.start > 0]
         self._warm_owned = {it.key for it in warm}
@@ -458,7 +459,8 @@ class AdaptiveCPController:
                 items.append(item)
                 continue
             start = agreed[item.key]
-            if item.start - start > max_gap:
+            last_in_plan = item is plan.items[-1]
+            if item.start - start > max_gap or (start < item.start and not last_in_plan):
                 # Replicas lack too much of the prefix: the owner runs it in DP.
                 self.stats["warm_cut"] += 1
                 if item.owner == self.rank:
@@ -477,9 +479,11 @@ class AdaptiveCPController:
             assert req.prefix_len == start, (req.rid, req.prefix_len, start, item)
             if start > 0:
                 req.lock = self.s.tree_cache.lock(req.last_node)
+            # The chunk keeps its planned size (the memory the plan checked); it
+            # starts earlier, so it may now end before the request does.
             items.append(
                 msgspec.structs.replace(
-                    item, start=start, take=item.take + (item.start - start)
+                    item, start=start, take=min(item.take, item.length - start)
                 )
             )
         return msgspec.structs.replace(plan, items=items)
