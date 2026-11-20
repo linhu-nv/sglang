@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -612,9 +613,20 @@ class SchedulePolicy:
         )
         return max(1, len(r.origin_input_ids) + len(r.output_ids) - cached)
 
+    @staticmethod
+    def _shortest_prefill_overdue(r: Req) -> bool:
+        """Waited longer than SGLANG_SPF_MAX_WAIT_S since it entered the queue."""
+        limit = envs.SGLANG_SPF_MAX_WAIT_S.get()
+        t0 = r.time_stats.wait_queue_entry_time
+        return limit > 0 and t0 > 0 and time.perf_counter() - t0 > limit
+
     def _shortest_prefill_rank(self, r: Req, processed_tokens: int) -> float:
         # Aging lowers the rank by the prefill work done while the request
         # waited, bounding its wait to about work / factor processed tokens.
+        # An overdue request goes first (oldest first): a wall-time bound on the
+        # wait of long prefills behind a stream of short ones.
+        if self._shortest_prefill_overdue(r):
+            return -1e18 + r.time_stats.wait_queue_entry_time
         waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
         return (
             self._shortest_prefill_work(r)
@@ -651,6 +663,8 @@ class SchedulePolicy:
             self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
             or budget < 2 * page_size
         ):
+            return None
+        if self._shortest_prefill_overdue(chunked_req):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         chunked_waited = max(0, processed_tokens - chunked_req.arrival_processed_tokens)

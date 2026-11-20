@@ -818,6 +818,8 @@ class Envs:
     SGLANG_ADAPTIVE_CP_MAX_BURST = EnvInt(4)
     # Release a lane request whose predicted DP finish beats its CP finish behind the lane.
     SGLANG_ADAPTIVE_CP_RELEASE_ETA = EnvBool(True)
+    # shortest-prefill-first: a request waiting longer than this (s) goes first; 0 = off.
+    SGLANG_SPF_MAX_WAIT_S = EnvFloat(0.0)
     # rule "deadline": a lane request runs in CP when wait + predicted CP time reaches
     # this, or at once when every rank has at most LIGHT_TOKENS of DP work queued.
     SGLANG_ADAPTIVE_CP_DEADLINE_S = EnvFloat(20.0)
