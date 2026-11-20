@@ -19,6 +19,8 @@ class StepStatsLogger:
         self.pending = collections.deque()
         self.seen = collections.OrderedDict()
         self.f = None
+        # Per-request detail: [rid, computed tokens, prefix tokens] per row.
+        self.with_rids = os.environ.get("SGLANG_STEP_STATS_RIDS") == "1"
         if self.dir:
             os.makedirs(self.dir, exist_ok=True)
             self.f = open(os.path.join(self.dir, f"dp_rank_{self.dp_rank}.jsonl"), "a", buffering=1)
@@ -32,6 +34,9 @@ class StepStatsLogger:
                    dp_rank=self.dp_rank, forward_iter=batch.forward_iter, mode=str(batch.forward_mode.name),
                    launch_ts=time.time())
         lens, sched, cached, comp, dev, host, sto = [], 0, 0, 0, 0, 0, 0
+        detail = []
+        if extend_mode and self.with_rids:
+            detail = [[req.rid, int(extend[i]), int(prefix[i])] for i, req in enumerate(reqs)]
         if extend_mode:
             for i, req in enumerate(reqs):
                 lens.append(len(req.origin_input_ids))
@@ -54,6 +59,11 @@ class StepStatsLogger:
                    scheduled_token_sum=sched, cached_token_sum=cached, compute_token_sum=comp,
                    device_cached_token_sum=dev, host_cached_token_sum=host, storage_cached_token_sum=sto,
                    num_reqs_batch=len(reqs))
+        if self.with_rids:
+            row["reqs"] = detail
+            cp = getattr(batch, "adaptive_cp", None)
+            if cp is not None:
+                row["cp_items"] = [[it.owner, it.cp_id, it.start, it.take] for it in cp.items]
         self.pending.append(row)
 
     def on_result(self) -> None:
