@@ -120,6 +120,11 @@ class PolicyConfig(msgspec.Struct, frozen=True):
     # token rate against alpha x the next DP step's, with the lane request in it.
     rule: str = "rate"
     alpha: float = 1.0
+    # "deadline" rule: lane requests are never handed to DP; one runs in CP when its
+    # wait plus its predicted CP time reaches deadline_s, or at once when every
+    # rank has at most light_tokens of DP work queued.
+    deadline_s: float = 20.0
+    light_tokens: int = 8192
 
 
 class LaneEntry(msgspec.Struct, frozen=True):
@@ -527,7 +532,7 @@ def decide(
     if cfg.force:
         return plan
     taken = {it.key for it in plan.items} | set(plan.release) | set(plan.drop)
-    if cfg.release_eta:
+    if cfg.release_eta and cfg.rule != "deadline":
         late = _eta_releases(views, cfg, model, taken)
         if late:
             plan = msgspec.structs.replace(plan, release=sorted(plan.release + late))
@@ -619,6 +624,9 @@ def _decide(
     if cfg.rule == "rate":
         return _decide_rate(views, waiting, drop, cfg, model, cap)
 
+    if cfg.rule == "deadline":
+        return _decide_deadline(views, waiting, drop, cfg, model, cap)
+
     best = None
     for k in range(1, min(len(waiting), cfg.max_batch_reqs) + 1):
         batch = waiting[:k]
@@ -681,6 +689,31 @@ def _decide_rate(views, waiting, drop, cfg, model, cap) -> Plan:
     return Plan(release=release, drop=drop, reason="dp", cost_dp=r_dp, cost_cp=r_cp)
 
 
+def _cp_eta(e: LaneEntry, cap: int, model: StepModel) -> float:
+    rem = e.length - e.done
+    steps = -(-rem // max(cap, 1))
+    return steps * (model.cp_c + model.cp_e) + model.cp_b * rem
+
+
+def _decide_deadline(views, waiting, drop, cfg, model, cap) -> Plan:
+    """Shorts keep the DP ranks (with shortest-prefill-first they never queue behind
+    long work, which stays in the lane); a lane request runs in CP when its deadline
+    is near, or right away when the DP ranks are nearly idle."""
+    light = all(
+        sum(r for r, _ in v.dp) + v.tail_tokens <= cfg.light_tokens for v in views
+    )
+    urgent = [
+        e for e in waiting if e.wait_ms / 1000 + _cp_eta(e, cap, model) >= cfg.deadline_s
+    ]
+    batch = (urgent or (waiting if light else []))[: cfg.max_batch_reqs]
+    if not batch:
+        return Plan(drop=drop, reason="hold")
+    items = _shrink_to_fit(_first_step(batch, cfg, cap), views, cfg)
+    if not items:
+        return Plan(drop=drop, reason="hold:no-memory")
+    return Plan(items=items, drop=drop, reason="deadline" if urgent else "light")
+
+
 def config_from_env() -> Tuple[PolicyConfig, StepModel]:
     from sglang.srt.environ import envs
 
@@ -696,6 +729,8 @@ def config_from_env() -> Tuple[PolicyConfig, StepModel]:
         release_always=envs.SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS.get(),
         max_cp_burst=envs.SGLANG_ADAPTIVE_CP_MAX_BURST.get(),
         release_eta=envs.SGLANG_ADAPTIVE_CP_RELEASE_ETA.get(),
+        deadline_s=envs.SGLANG_ADAPTIVE_CP_DEADLINE_S.get(),
+        light_tokens=envs.SGLANG_ADAPTIVE_CP_LIGHT_TOKENS.get(),
     )
     path: Optional[str] = envs.SGLANG_ADAPTIVE_CP_MODEL.get() or None
     model = StepModel.from_json(path) if path else StepModel()

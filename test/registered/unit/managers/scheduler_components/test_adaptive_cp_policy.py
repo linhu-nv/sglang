@@ -192,3 +192,27 @@ class TestDecide(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeadlineRule(CustomTestCase):
+    CFG = pol.PolicyConfig(rule="deadline", deadline_s=20.0, light_tokens=8192)
+
+    def test_hold_while_busy(self):
+        busy = [(30000, 40000)]
+        rows = [_row(dp=busy, lane=[_lane(1, 60000, wait_ms=1000)])] + [_row(dp=busy)] * 7
+        plan = _plan(rows, self.CFG)
+        self.assertFalse(plan.is_cp)
+        self.assertEqual((plan.release, plan.reason), ([], "hold"))
+
+    def test_cp_when_deadline_near(self):
+        busy = [(30000, 40000)]
+        rows = [_row(dp=busy, lane=[_lane(1, 60000, wait_ms=19000)])] + [_row(dp=busy)] * 7
+        plan = _plan(rows, self.CFG)
+        self.assertTrue(plan.is_cp)
+        self.assertEqual(plan.reason, "deadline")
+
+    def test_cp_when_light(self):
+        rows = [_row(dp=[(500, 900)], lane=[_lane(1, 60000, wait_ms=0)])] + [_row()] * 7
+        plan = _plan(rows, self.CFG)
+        self.assertTrue(plan.is_cp)
+        self.assertEqual(plan.reason, "light")
