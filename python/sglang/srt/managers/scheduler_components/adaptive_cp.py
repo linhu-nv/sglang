@@ -444,14 +444,32 @@ class AdaptiveCPController:
         for item in warm:
             rid, ids = self._broadcast_inputs(item)
             if item.owner == self.rank:
-                local.append(self.owned[item.cp_id].req.prefix_len)
+                req = self.owned[item.cp_id].req
             else:
                 req = self._new_replica(item, rid, ids)
                 self._warm_replicas[item.key] = req
-                local.append(self._match_upto(req, item.start))
+            local.append(self._match_upto(req, item.start))
+        cpu = self.group.cpu_group
         t = torch.tensor(local, dtype=torch.int64)
-        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=self.group.cpu_group)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=cpu)
         agreed = dict(zip([it.key for it in warm], t.tolist()))
+        # Re-match down to the agreed start; a rank whose tree cannot give exactly
+        # that boundary (window or page truncation) makes every rank run it in DP.
+        exact = []
+        for item in warm:
+            req = (
+                self.owned[item.cp_id].req
+                if item.owner == self.rank
+                else self._warm_replicas[item.key]
+            )
+            if req.prefix_len != agreed[item.key]:
+                self._match_upto(req, agreed[item.key])
+            exact.append(1 if req.prefix_len == agreed[item.key] else 0)
+        e = torch.tensor(exact, dtype=torch.int64)
+        torch.distributed.all_reduce(e, op=torch.distributed.ReduceOp.MIN, group=cpu)
+        for item, ok in zip(warm, e.tolist()):
+            if not ok:
+                agreed[item.key] = -1
         items = []
         max_gap = min(self.cfg.cp_chunk // 4, 16384)
         for item in plan.items:
@@ -460,7 +478,11 @@ class AdaptiveCPController:
                 continue
             start = agreed[item.key]
             last_in_plan = item is plan.items[-1]
-            if item.start - start > max_gap or (start < item.start and not last_in_plan):
+            if (
+                start < 0
+                or item.start - start > max_gap
+                or (start < item.start and not last_in_plan)
+            ):
                 # Replicas lack too much of the prefix: the owner runs it in DP.
                 self.stats["warm_cut"] += 1
                 if item.owner == self.rank:
@@ -468,15 +490,11 @@ class AdaptiveCPController:
                 else:
                     self._free_replica(self._warm_replicas.pop(item.key), keep=False)
                 continue
-            if item.owner == self.rank:
-                req = self.owned[item.cp_id].req
-                if req.prefix_len > start:
-                    self._match_upto(req, start)
-            else:
-                req = self._warm_replicas[item.key]
-                if req.prefix_len > start:
-                    self._match_upto(req, start)
-            assert req.prefix_len == start, (req.rid, req.prefix_len, start, item)
+            req = (
+                self.owned[item.cp_id].req
+                if item.owner == self.rank
+                else self._warm_replicas[item.key]
+            )
             if start > 0:
                 req.lock = self.s.tree_cache.lock(req.last_node)
             # The chunk keeps its planned size (the memory the plan checked); it
