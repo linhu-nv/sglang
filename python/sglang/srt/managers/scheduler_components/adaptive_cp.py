@@ -88,6 +88,9 @@ class AdaptiveCPController:
             envs.SGLANG_ADAPTIVE_CP_EVICT_FRAC.get() * scheduler.max_total_num_tokens
         )
         self.has_window = bool(scheduler.token_to_kv_pool_allocator.window_pool_names())
+        # Replicas insert their CP KV into their own tree (as the owner does), so a
+        # later warm turn of the session finds its prefix on every rank.
+        self.keep_replicas = envs.SGLANG_ADAPTIVE_CP_KEEP_REPLICAS.get() or self.cfg.warm_tokens > 0
         self.lane = IndexedReqList(ListKind.ADAPTIVE_CP, abort=self._abort)
         self.owned: Dict[int, _Owned] = {}
         self.replicas: Dict[Tuple[int, int], Req] = {}
@@ -103,6 +106,8 @@ class AdaptiveCPController:
             "dropped": 0,
             "dp_steps": 0,
             "yields": 0,
+            "warm_in": 0,
+            "warm_cut": 0,
         }
         self.last_plan_reason = ""
         self.last_log = time.monotonic()
@@ -183,7 +188,12 @@ class AdaptiveCPController:
                 self.arrivals.append((now, self._uncached_estimate(req), req.seqlen))
             if req.adaptive_cp_checked:
                 continue
-            if req.seqlen < self.cfg.min_tokens or not self._eligible(req):
+            min_len = (
+                min(self.cfg.min_tokens, self.cfg.warm_tokens)
+                if self.cfg.warm_tokens > 0
+                else self.cfg.min_tokens
+            )
+            if req.seqlen < min_len or not self._eligible(req):
                 req.adaptive_cp_checked = True
                 continue
             if s.tree_cache.has_uncommitted_restore(req):
@@ -203,15 +213,23 @@ class AdaptiveCPController:
             if defer_cow_slot:
                 s._drop_unadmitted_match(req)
             req.adaptive_cp_checked = True
-            cold = (
-                req.prefix_len == 0
-                and req.host_hit_length == 0
-                and req.storage_hit_length == 0
+            no_host = req.host_hit_length == 0 and req.storage_hit_length == 0
+            cold = req.prefix_len == 0 and no_host and req.seqlen >= self.cfg.min_tokens
+            # Warm: a device prefix only (a host hit restores through DP).
+            warm = (
+                self.cfg.warm_tokens > 0
+                and req.prefix_len > 0
+                and no_host
+                and req.seqlen - req.prefix_len >= self.cfg.warm_tokens
             )
-            if cold and self.cfg.force != "dp":
+            if (cold or warm) and self.cfg.force != "dp":
                 claimed.append(req)
         for req in claimed:
-            st = _Owned(req=req, cp_id=self.next_cp_id, enqueued=now)
+            st = _Owned(
+                req=req, cp_id=self.next_cp_id, enqueued=now, done=req.prefix_len
+            )
+            if req.prefix_len > 0:
+                self.stats["warm_in"] += 1
             self.next_cp_id += 1
             self.owned[st.cp_id] = st
             req.adaptive_cp_owner = self.rank
@@ -344,9 +362,11 @@ class AdaptiveCPController:
             req = st.req
             if st.started and req.prefix_len < req.extend_end and not req.finished():
                 checkpoint_kv_cache(req, tree)
-        if tree.supports_swa():
-            for req in self.replicas.values():
-                if req.prefix_len < req.extend_end:
+        for req in self.replicas.values():
+            if req.prefix_len < req.extend_end:
+                if self.keep_replicas:
+                    checkpoint_kv_cache(req, tree)
+                elif tree.supports_swa():
                     retire_window(req, req.extend_end, tree)
                     req.prefix_len = req.extend_end
 
@@ -360,7 +380,7 @@ class AdaptiveCPController:
         else:
             replica = self.replicas.pop(key, None)
             if replica is not None:
-                self._free_replica(replica)
+                self._free_replica(replica, keep=False)
 
     def _release_to_dp(self, key: Tuple[int, int]) -> None:
         owner, cp_id = key
@@ -393,21 +413,88 @@ class AdaptiveCPController:
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.skip_radix_cache_insert = True
+        req.skip_radix_cache_insert = not self.keep_replicas
         req.adaptive_cp_owner = item.owner
         req.adaptive_cp_id = item.cp_id
         assert len(ids) == item.length, (len(ids), item)
         move([req], self.lane)
         return req
 
-    def _build(self, plan: policy.Plan) -> ScheduleBatch:
+    def _match_upto(self, req: Req, limit: int) -> int:
+        """Match ``req`` against this rank's tree, at most ``limit`` tokens."""
+        req._compute_max_prefix_len = lambda input_len: max(0, min(input_len - 1, limit))
+        try:
+            req.init_next_round_input(self.s.tree_cache)
+        finally:
+            del req._compute_max_prefix_len
+        return req.prefix_len
+
+    def _settle_warm_prefixes(self, plan: policy.Plan) -> policy.Plan:
+        """A warm item starts where every rank has the prefix in its own tree: the
+        minimum over ranks of the device match (capped at the owner's prefix). The
+        chunk grows by the cut so it ends where the plan said; ranks lock their
+        prefix nodes for the request's CP chunks."""
+        self._warm_replicas: Dict[Tuple[int, int], Req] = {}
+        warm = [it for it in plan.items if it.first and it.start > 0]
+        self._warm_owned = {it.key for it in warm}
+        if not warm:
+            return plan
+        local = []
+        for item in warm:
+            rid, ids = self._broadcast_inputs(item)
+            if item.owner == self.rank:
+                local.append(self.owned[item.cp_id].req.prefix_len)
+            else:
+                req = self._new_replica(item, rid, ids)
+                self._warm_replicas[item.key] = req
+                local.append(self._match_upto(req, item.start))
+        t = torch.tensor(local, dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=self.group.cpu_group)
+        agreed = dict(zip([it.key for it in warm], t.tolist()))
+        items = []
+        max_gap = min(self.cfg.cp_chunk // 4, 16384)
+        for item in plan.items:
+            if item.key not in agreed:
+                items.append(item)
+                continue
+            start = agreed[item.key]
+            if item.start - start > max_gap:
+                # Replicas lack too much of the prefix: the owner runs it in DP.
+                self.stats["warm_cut"] += 1
+                if item.owner == self.rank:
+                    self._release_to_dp(item.key)
+                else:
+                    self._free_replica(self._warm_replicas.pop(item.key), keep=False)
+                continue
+            if item.owner == self.rank:
+                req = self.owned[item.cp_id].req
+                if req.prefix_len > start:
+                    self._match_upto(req, start)
+            else:
+                req = self._warm_replicas[item.key]
+                if req.prefix_len > start:
+                    self._match_upto(req, start)
+            assert req.prefix_len == start, (req.rid, req.prefix_len, start, item)
+            if start > 0:
+                req.lock = self.s.tree_cache.lock(req.last_node)
+            items.append(
+                msgspec.structs.replace(
+                    item, start=start, take=item.take + (item.start - start)
+                )
+            )
+        return msgspec.structs.replace(plan, items=items)
+
+    def _build(self, plan: policy.Plan) -> Optional[ScheduleBatch]:
         s = self.s
         reqs: List[Req] = []
         unmergeable: List[Req] = []
         finished_replicas: List[Req] = []
         launched: List[Req] = []
+        plan = self._settle_warm_prefixes(plan)
+        if not plan.items:
+            return None
         for item in plan.items:
-            if item.first:
+            if item.first and item.key not in self._warm_owned:
                 rid, ids = self._broadcast_inputs(item)
             if item.owner == self.rank:
                 st = self.owned[item.cp_id]
@@ -421,7 +508,9 @@ class AdaptiveCPController:
                     unmergeable.append(req)
             else:
                 if item.first:
-                    req = self._new_replica(item, rid, ids)
+                    req = self._warm_replicas.pop(item.key, None) or self._new_replica(
+                        item, rid, ids
+                    )
                     self.replicas[item.key] = req
                 else:
                     req = self.replicas[item.key]
@@ -496,11 +585,12 @@ class AdaptiveCPController:
         for req in batch.adaptive_cp.finished_replicas:
             self._free_replica(req)
 
-    def _free_replica(self, req: Req) -> None:
+    def _free_replica(self, req: Req, *, keep: Optional[bool] = None) -> None:
         if req.owner_list is self.lane:
             self.lane._leave([req])
         if req.kv.holds_kv:
-            release_kv_cache(req, self.s.tree_cache, checkpoint=False)
+            keep = self.keep_replicas if keep is None else keep
+            release_kv_cache(req, self.s.tree_cache, checkpoint=keep)
 
 
 def maybe_init_adaptive_cp(scheduler: "Scheduler") -> Optional[AdaptiveCPController]:

@@ -125,6 +125,10 @@ class PolicyConfig(msgspec.Struct, frozen=True):
     # rank has at most light_tokens of DP work queued.
     deadline_s: float = 20.0
     light_tokens: int = 8192
+    # Warm lane requests: a device prefix hit and at least this many tokens to
+    # compute (0 = cold requests only). Replicas reuse the prefix from their own
+    # tree (kept there by earlier CP chunks, keep_replicas).
+    warm_tokens: int = 0
 
 
 class LaneEntry(msgspec.Struct, frozen=True):
@@ -166,6 +170,8 @@ class CPItem(msgspec.Struct, frozen=True):
     start: int
     take: int
     length: int
+    # The request's first CP chunk (start > 0 for a warm request: its cached prefix).
+    fresh: bool = False
 
     @property
     def key(self) -> Tuple[int, int]:
@@ -173,7 +179,7 @@ class CPItem(msgspec.Struct, frozen=True):
 
     @property
     def first(self) -> bool:
-        return self.start == 0
+        return self.fresh or self.start == 0
 
     @property
     def last(self) -> bool:
@@ -509,6 +515,7 @@ def _first_step(
             start=start,
             take=take,
             length=batch[i].length,
+            fresh=not batch[i].started,
         )
         for i, start, take in steps[0]
     ]
@@ -731,6 +738,7 @@ def config_from_env() -> Tuple[PolicyConfig, StepModel]:
         release_eta=envs.SGLANG_ADAPTIVE_CP_RELEASE_ETA.get(),
         deadline_s=envs.SGLANG_ADAPTIVE_CP_DEADLINE_S.get(),
         light_tokens=envs.SGLANG_ADAPTIVE_CP_LIGHT_TOKENS.get(),
+        warm_tokens=envs.SGLANG_ADAPTIVE_CP_WARM_TOKENS.get(),
     )
     path: Optional[str] = envs.SGLANG_ADAPTIVE_CP_MODEL.get() or None
     model = StepModel.from_json(path) if path else StepModel()

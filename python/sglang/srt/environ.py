@@ -824,6 +824,10 @@ class Envs:
     # this, or at once when every rank has at most LIGHT_TOKENS of DP work queued.
     SGLANG_ADAPTIVE_CP_DEADLINE_S = EnvFloat(20.0)
     SGLANG_ADAPTIVE_CP_LIGHT_TOKENS = EnvInt(8192)
+    # Warm requests (device prefix hit) with at least this many tokens to compute
+    # join the lane too (0 = off); replicas keep their CP KV in their own tree.
+    SGLANG_ADAPTIVE_CP_WARM_TOKENS = EnvInt(0)
+    SGLANG_ADAPTIVE_CP_KEEP_REPLICAS = EnvBool(False)
     SGLANG_ADAPTIVE_CP_SWITCH_S = EnvFloat(0.02)
     # Step-time models, JSON {"dp": {c, b, a, d}, "cp": {c, b, a}}; empty = built-in H20 DSv4.1 fit.
     SGLANG_ADAPTIVE_CP_MODEL = EnvStr("")

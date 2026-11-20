@@ -216,3 +216,18 @@ class TestDeadlineRule(CustomTestCase):
         plan = _plan(rows, self.CFG)
         self.assertTrue(plan.is_cp)
         self.assertEqual(plan.reason, "light")
+
+
+class TestWarmItems(CustomTestCase):
+    def test_warm_first_chunk_is_fresh(self):
+        # A warm lane request starts at its cached prefix; its first chunk is fresh.
+        rows = [_row(lane=[_lane(1, 60000, done=20480, wait_ms=0)])] + [_row()] * 7
+        plan = _plan(rows, pol.PolicyConfig(force="cp"))
+        (item,) = plan.items
+        self.assertEqual((item.start, item.fresh, item.first), (20480, True, True))
+
+    def test_started_chunk_not_fresh(self):
+        lane = [_lane(1, 200000, done=65536, wait_ms=0, started=True)]
+        rows = [_row(lane=lane)] + [_row()] * 7
+        (item,) = _plan(rows).items
+        self.assertEqual((item.start, item.fresh, item.first), (65536, False, False))
