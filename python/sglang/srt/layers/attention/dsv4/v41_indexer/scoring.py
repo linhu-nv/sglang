@@ -405,6 +405,43 @@ class DecodeScores(msgspec.Struct, frozen=True):
     scores: torch.Tensor  # [bs, lmax]
 
 
+def _request_rows(inputs, req, compress_lens, ratio):
+    """Per request: (first flattened-K column, its query rows, their visible
+    compressed lengths, columns to score).
+
+    Rows of a request are contiguous and requests follow ``req_pool_indices``.
+    With the per-request row counts on the CPU, the columns are bounded by the
+    request's visible length (``seq_len // ratio``) and the K offsets follow from
+    ``seq_lens_cpu``: no device sync. Rows that see fewer positions are masked as
+    before, so the selection is unchanged. Otherwise fall back to the
+    data-dependent split (device syncs per request)."""
+    rows = inputs.rows_per_request
+    seq_lens = inputs.seq_lens_cpu
+    k_offsets = list(itertools.accumulate((s // ratio for s in seq_lens), initial=0))
+    if (
+        rows is not None
+        and len(rows) == len(seq_lens)
+        and sum(rows) == compress_lens.numel()
+    ):
+        start = 0
+        for i, (n, s) in enumerate(zip(rows, seq_lens)):
+            if n > 0:
+                yield (
+                    k_offsets[i],
+                    torch.arange(start, start + n, device=compress_lens.device),
+                    compress_lens[start : start + n],
+                    s // ratio,
+                )
+            start += n
+        return
+    # First flattened-K column of each request row, as inputs.k_slots lays them out.
+    k_starts = dict(zip(inputs.req_pool_indices.tolist(), k_offsets))
+    for r in torch.unique_consecutive(req).tolist():
+        tok = (req == r).nonzero().squeeze(1)
+        lens = compress_lens[tok]
+        yield k_starts[r], tok, lens, int(lens.max().item())
+
+
 def prefill_requests(
     *,
     inputs: PrefillInputs,
@@ -429,27 +466,17 @@ def prefill_requests(
             inputs.req_pool_indices, repeats, output_size=pos.numel()
         )
     assert inputs.seq_lens_cpu is not None
-    # First flattened-K column of each request row, as inputs.k_slots lays them out.
-    k_starts = dict(
-        zip(
-            inputs.req_pool_indices.tolist(),
-            itertools.accumulate((s // ratio for s in inputs.seq_lens_cpu), initial=0),
-        )
-    )
     inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
-    for r in torch.unique_consecutive(req).tolist():
-        tok = (req == r).nonzero().squeeze(1)
-        lens = compress_lens[tok]
-        lc = int(lens.max().item())
+    for k_start, tok, lens, lc in _request_rows(inputs, req, compress_lens, ratio):
         if lc == 0:
             continue
         j = torch.arange(lc, device=pos.device)
-        slots = inputs.k_slots[k_starts[r] : k_starts[r] + lc]
+        slots = inputs.k_slots[k_start : k_start + lc]
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
