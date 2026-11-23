@@ -816,6 +816,8 @@ class Envs:
     SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS = EnvBool(False)
     # CP steps in a row before one DP step when any rank has DP work (1 when one decodes).
     SGLANG_ADAPTIVE_CP_MAX_BURST = EnvInt(4)
+    # Tokens of one CP step while any rank has DP requests queued; 0 = the CP chunk.
+    SGLANG_ADAPTIVE_CP_QUEUED_CHUNK = EnvInt(0)
     # Release a lane request whose predicted DP finish beats its CP finish behind the lane.
     SGLANG_ADAPTIVE_CP_RELEASE_ETA = EnvBool(True)
     # shortest-prefill-first: a request waiting longer than this (s) goes first; 0 = off.

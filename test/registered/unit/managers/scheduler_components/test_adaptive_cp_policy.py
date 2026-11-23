@@ -99,6 +99,16 @@ class TestDecide(CustomTestCase):
         self.assertEqual((item.start, item.take), (65536, 100000 - 65536))
         self.assertTrue(item.last)
 
+    def test_queued_dp_work_shrinks_the_cp_step(self):
+        cfg = pol.PolicyConfig(queued_cp_chunk=16384)
+        lane = [_lane(1, 400000, done=65536, started=True)]
+        queued = [_row(lane=lane)] + [_row(dp=[(2000, 30000)]) for _ in range(7)]
+        (item,) = _plan(queued, cfg).items
+        self.assertEqual(item.take, 16384)
+        idle = [_row(lane=lane)] + [_row() for _ in range(7)]
+        (item,) = _plan(idle, cfg).items
+        self.assertEqual(item.take, cfg.cp_chunk)
+
     def test_cp_burst_yields_one_dp_step(self):
         """A long started request must not starve DP work: after max_cp_burst CP
         steps one DP step runs, then the request continues."""
