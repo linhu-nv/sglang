@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -354,6 +355,11 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # Steps between storage-removal syncs; idle steps join no collective.
+        self.removal_check_interval = max(
+            1, envs.SGLANG_LINKER_REMOVAL_CHECK_INTERVAL.get()
+        )
+        self._event_steps = 0
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -909,15 +915,41 @@ class UnifiedCacheLinkerWrapper:
                 )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
-    def drain_storage_removals(self) -> None:
+    def poll_events(self) -> None:
+        """Per-step poll of offload completions, storage removals and prefetches.
+
+        Completions and removal flags share one MIN all-reduce, skipped when no
+        offload is pending and no removal check is due. ``pending_offloads``
+        and the step counter only change in lockstep tree operations, so every
+        rank takes the same branch and joins the same collectives.
+        """
+        self._event_steps += 1
         medium = self.cache_linker.local_storage_medium
-        if medium is None:
-            return
-        hashes = self.cache_linker.pop_storage_removals()
-        any_removed = torch.tensor([bool(hashes)], dtype=torch.int)
-        self.cache._all_reduce_attn_groups(any_removed, torch.distributed.ReduceOp.MAX)
-        if not any_removed.item():
-            return
+        check_removals = (
+            medium is not None and self._event_steps % self.removal_check_interval == 0
+        )
+        if self.pending_offloads or check_removals:
+            hashes = self.cache_linker.pop_storage_removals() if check_removals else []
+            # MIN over [completed, -removed] = (min completed, max removed).
+            state = torch.tensor(
+                [self.num_completed_offloads(), -int(bool(hashes))], dtype=torch.int
+            )
+            self.cache._all_reduce_attn_groups(state, torch.distributed.ReduceOp.MIN)
+            offload_count, any_removed = int(state[0]), int(state[1]) < 0
+            local_successes = self.take_completed_offloads(offload_count)
+            if local_successes:
+                successes = torch.tensor(local_successes, dtype=torch.int)
+                self.cache._all_reduce_attn_groups(
+                    successes, torch.distributed.ReduceOp.MIN
+                )
+                self.commit_completed_offloads(
+                    [bool(success) for success in successes.tolist()]
+                )
+            if any_removed:
+                self._apply_storage_removals(hashes, medium)
+        self.check_prefetch_events()
+
+    def _apply_storage_removals(self, hashes: list[str], medium) -> None:
         all_hashes = set(hashes)
         groups = [
             group

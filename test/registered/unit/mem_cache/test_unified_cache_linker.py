@@ -1863,6 +1863,7 @@ def test_local_inventory_tracks_storage_removal_after_tree_eviction(
         dec_lock_ref=lambda *args: None,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    wrapper.removal_check_interval = 1
     wrapper.offload_nodes([node.id])
     assert core.kv_events.take() == []
     backend.completed_offloads.append(success)
@@ -1878,7 +1879,10 @@ def test_local_inventory_tracks_storage_removal_after_tree_eviction(
     if remote_removal:
         cache.tp_world_size = 2
         cache.tp_group = object()
-        cache._all_reduce_attn_groups = lambda value, op: value.fill_(1)
+        # No offload completed; another rank reported a removal.
+        cache._all_reduce_attn_groups = lambda value, op: value.copy_(
+            torch.tensor([0, -1])
+        )
         monkeypatch.setattr(torch.distributed, "get_world_size", lambda **kwargs: 2)
         monkeypatch.setattr(
             torch.distributed,
@@ -1887,7 +1891,7 @@ def test_local_inventory_tracks_storage_removal_after_tree_eviction(
                 slice(None), [local, hashes[:1]]
             ),
         )
-        wrapper.drain_storage_removals()
+        wrapper.poll_events()
         assert not node.external_cache_stored
         assert core.kv_events.take() == []
         assert set(core._external_cache_event_hashes) == (
@@ -1895,7 +1899,7 @@ def test_local_inventory_tracks_storage_removal_after_tree_eviction(
         )
 
     removals.append(hashes[0])
-    wrapper.drain_storage_removals()
+    wrapper.poll_events()
     assert not node.external_cache_stored
     removed = core.kv_events.take()
     if stored:
@@ -1906,7 +1910,7 @@ def test_local_inventory_tracks_storage_removal_after_tree_eviction(
 
     core.nodes.clear()
     removals[:] = [hashes[1]]
-    wrapper.drain_storage_removals()
+    wrapper.poll_events()
     removed = core.kv_events.take()
     if stored:
         assert removed[0].block_hashes == stored[0].block_hashes[1:]
@@ -2400,14 +2404,15 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
 
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
-    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache.linker = SimpleNamespace(
-        num_completed_offloads=lambda: 3,
-        take_completed_offloads=lambda count: [True] * count,
-        commit_completed_offloads=committed.append,
-        check_prefetch_events=lambda: None,
-        drain_storage_removals=lambda: None,
-    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache_linker = SimpleNamespace(local_storage_medium=None)
+    wrapper.pending_offloads = [object()] * 3
+    wrapper.removal_check_interval = 16
+    wrapper._event_steps = 0
+    wrapper.num_completed_offloads = lambda: 3
+    wrapper.take_completed_offloads = lambda count: [True] * count
+    wrapper.commit_completed_offloads = committed.append
+    wrapper.check_prefetch_events = lambda: None
 
     reduce_calls = 0
 
@@ -2416,15 +2421,48 @@ def test_check_hicache_events_commits_common_rank_results():
         assert op == torch.distributed.ReduceOp.MIN
         reduce_calls += 1
         if reduce_calls == 1:
-            value.copy_(torch.tensor([1]))
+            assert value.tolist() == [3, 0]
+            value.copy_(torch.tensor([1, 0]))
         else:
             value.fill_(0)
 
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = wrapper
     cache._all_reduce_attn_groups = reduce_to_common_state
+    wrapper.cache = cache
 
     cache.check_hicache_events()
 
     assert committed == [[False]]
+
+
+def test_poll_events_skips_collectives_when_idle():
+    """No collective without pending offloads or a due removal check; one MIN
+    collective carries both otherwise."""
+    calls = []
+    removals = [["h1"], []]
+    applied = []
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(
+        _all_reduce_attn_groups=lambda tensor, op: calls.append(tensor.tolist())
+    )
+    wrapper.cache_linker = SimpleNamespace(
+        local_storage_medium=StorageMedium.CPU,
+        pop_storage_removals=lambda: removals.pop(0) if removals else [],
+        num_completed_offloads=lambda: 0,
+    )
+    wrapper.pending_offloads = []
+    wrapper.prefetches = {}
+    wrapper.removal_check_interval = 4
+    wrapper._event_steps = 0
+    wrapper._apply_storage_removals = lambda hashes, medium: applied.append(hashes)
+
+    for _ in range(3):
+        wrapper.poll_events()
+    assert calls == []
+    wrapper.poll_events()  # step 4: removal check due
+    assert calls == [[0, -1]]
+    assert applied == [["h1"]]
 
 
 @pytest.mark.parametrize(
