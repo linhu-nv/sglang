@@ -818,6 +818,9 @@ class Envs:
     SGLANG_ADAPTIVE_CP_MAX_BURST = EnvInt(4)
     # Tokens of one CP step while any rank has DP requests queued; 0 = the CP chunk.
     SGLANG_ADAPTIVE_CP_QUEUED_CHUNK = EnvInt(0)
+    # CP bursts follow the deadline: one CP step at a time while lane requests are on
+    # track, MAX_BURST in a row once one is behind its deadline.
+    SGLANG_ADAPTIVE_CP_DEADLINE_BURST = EnvBool(False)
     # Release a lane request whose predicted DP finish beats its CP finish behind the lane.
     SGLANG_ADAPTIVE_CP_RELEASE_ETA = EnvBool(True)
     # shortest-prefill-first: a request waiting longer than this (s) goes first; 0 = off.

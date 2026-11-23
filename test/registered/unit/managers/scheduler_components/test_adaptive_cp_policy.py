@@ -109,6 +109,16 @@ class TestDecide(CustomTestCase):
         (item,) = _plan(idle, cfg).items
         self.assertEqual(item.take, cfg.cp_chunk)
 
+    def test_deadline_burst_yields_while_on_track(self):
+        cfg = pol.PolicyConfig(deadline_burst=True, deadline_s=15.0)
+        dp = [_row(dp=[(2000, 30000)]) for _ in range(7)]
+        on_track = [_row(lane=[_lane(1, 200000, done=65536, wait_ms=2000, started=True)])]
+        views = pol.decode_rows(on_track + dp)
+        self.assertEqual(pol.decide(views, cfg, MODEL, cp_streak=1).reason, "yield")
+        late = [_row(lane=[_lane(1, 200000, done=65536, wait_ms=20000, started=True)])]
+        views = pol.decode_rows(late + dp)
+        self.assertTrue(pol.decide(views, cfg, MODEL, cp_streak=1).is_cp)
+
     def test_cp_burst_yields_one_dp_step(self):
         """A long started request must not starve DP work: after max_cp_burst CP
         steps one DP step runs, then the request continues."""

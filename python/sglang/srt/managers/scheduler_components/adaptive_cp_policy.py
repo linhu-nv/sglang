@@ -109,6 +109,10 @@ class PolicyConfig(msgspec.Struct, frozen=True):
     # Tokens of one CP step while any rank has DP requests queued (0 = cp_chunk):
     # keeps a CP step near a DP step's duration so queued short requests wait less.
     queued_cp_chunk: int = 0
+    # Burst by deadline: while every started lane request is on track for its
+    # deadline (wait + remaining CP time < deadline_s) one DP step follows each CP
+    # step; a request behind its deadline gets max_cp_burst steps in a row.
+    deadline_burst: bool = False
     # Release lane requests past max_wait also while CP steps run other requests
     # (otherwise only a DP decision releases them).
     release_always: bool = False
@@ -610,6 +614,11 @@ def _decide(
     dp_work = any(v.dp or v.tail_count or v.running for v in views)
     # Decoding requests get a DP step after every CP step.
     burst = 1 if any(v.running for v in views) else cfg.max_cp_burst
+    if cfg.deadline_burst and burst > 1 and not any(
+        e.wait_ms / 1000 + _cp_eta(e, cap or cfg.min_cp_chunk, model) >= cfg.deadline_s
+        for e in started
+    ):
+        burst = 1
     if cp_streak >= burst and dp_work and cfg.force != "cp":
         return Plan(drop=drop, reason="yield")
 
@@ -741,6 +750,7 @@ def config_from_env() -> Tuple[PolicyConfig, StepModel]:
         release_always=envs.SGLANG_ADAPTIVE_CP_RELEASE_ALWAYS.get(),
         max_cp_burst=envs.SGLANG_ADAPTIVE_CP_MAX_BURST.get(),
         queued_cp_chunk=envs.SGLANG_ADAPTIVE_CP_QUEUED_CHUNK.get(),
+        deadline_burst=envs.SGLANG_ADAPTIVE_CP_DEADLINE_BURST.get(),
         release_eta=envs.SGLANG_ADAPTIVE_CP_RELEASE_ETA.get(),
         deadline_s=envs.SGLANG_ADAPTIVE_CP_DEADLINE_S.get(),
         light_tokens=envs.SGLANG_ADAPTIVE_CP_LIGHT_TOKENS.get(),
