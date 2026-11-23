@@ -35,6 +35,7 @@ def get_startup_linker_config() -> dict[str, Any] | None:
     if config is None and memory.unified_cache_external_linker_backend in (
         "mooncake",
         "mori",
+        "kvcr",
     ):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
@@ -106,6 +107,12 @@ def create_unified_cache_linker(
         )
 
         linker_cls = UMBPDirectLinker
+    elif backend == "kvcr":
+        from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
+            KVCRDirectLinker,
+        )
+
+        linker_cls = KVCRDirectLinker
     else:
         raise ValueError(f"Unknown unified cache external linker backend: {backend!r}")
     if backend != "dynamic" and load_mode == "prefetch":

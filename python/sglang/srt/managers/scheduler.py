@@ -2100,7 +2100,15 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None:
+        hint_sources = self.kv_events_publisher.kv_hint_sources()
+        if hint_sources:
+            result_dict["kv_hint_sources"] = hint_sources
+            result_dict["kv_event_sources"] = (
+                self.kv_events_publisher.local_kv_event_sources(
+                    self.page_size * get_parallel().dcp_size
+                )
+            )
+        elif get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size

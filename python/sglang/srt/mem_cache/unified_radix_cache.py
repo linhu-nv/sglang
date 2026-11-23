@@ -25,6 +25,11 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -40,6 +45,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -1566,10 +1572,15 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
-        return self.session.try_cache_finished_req(req)
+        claimed = self.session.try_cache_finished_req(req)
+        if claimed and self.linker is not None and req.finished():
+            self.linker.release_request(req.cache_request_handle, cancel_load=False)
+        return claimed
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.linker is not None and req.finished():
+            self.linker.release_request(req.cache_request_handle, cancel_load=False)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -3443,6 +3454,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # The other stop policies end the prefetch when progress is checked.
         return self.enable_storage and self.prefetch_stop_policy == "wait_complete"
 
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        if outcome == CacheRequestOutcome.SUCCESS and self.linker is not None:
+            self.linker.release_request(handle, cancel_load=False)
+        super().finish(handle, outcome)
+
     @rank_consensus(same_params=True)
     def _abandon_attempt(self, request: CacheRequestHandle) -> None:
         rid = request.rid
@@ -4528,6 +4544,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     [bool(success) for success in successes.tolist()]
                 )
             self.linker.check_prefetch_events()
+            self.linker.drain_storage_removals()
             return
 
         if self.enable_storage:
@@ -4972,8 +4989,29 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.root_node
 
     def take_events(self):
-        # Drain the KV event queue from the TreeCore.
-        return self.tree_core.take_events()
+        events = self.tree_core.take_events()
+        if self.linker is not None:
+            backend = self.linker.cache_linker
+            if backend.local_storage_ownership is not None:
+                # Linker and HiCache are exclusive, so only the Linker owns this tier.
+                owned_events = []
+                for event in events:
+                    if (
+                        isinstance(event, (BlockStored, BlockRemoved))
+                        and event.medium == backend.local_storage_medium
+                    ):
+                        event.ownership = backend.local_storage_ownership
+                    owned_events.append(event)
+                    if (
+                        isinstance(event, AllBlocksCleared)
+                        and event.ownership is None
+                        and getattr(backend, "get_kv_hint_sources", lambda: [])()
+                    ):
+                        owned_events.append(
+                            AllBlocksCleared(ownership=backend.local_storage_ownership)
+                        )
+                events = owned_events
+        return events
 
     def resolve_node_handle(self, node_handle):
         """Look up the node object from its NodeId.

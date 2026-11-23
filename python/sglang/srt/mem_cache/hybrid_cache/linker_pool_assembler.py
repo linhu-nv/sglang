@@ -391,8 +391,10 @@ def _build_kv_device_pool_group(
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
 ) -> DevicePoolGroup:
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
 
+    if type(kvcache) is MHATokenToKVPool:
+        return _build_mha_device_pool_group(kvcache, page_size, mtp_draft_device_pools)
     if not isinstance(kvcache, DSATokenToKVPool):
         raise ValueError(
             "The direct external linker supports only DSA among single KV "
@@ -823,6 +825,42 @@ def _build_minimax_m3_nvfp4_device_pool_group(
     ]
     # Not rank_replicated: the KV heads are TP-sharded.
     return DevicePoolGroup(entries, main_pool.layer_num, page_size)
+
+
+def _build_mha_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    if type(kvcache) is not MHATokenToKVPool:
+        raise ValueError(
+            "The direct external linker does not support the "
+            f"{type(kvcache).__name__} device pool layout."
+        )
+    if kvcache.is_quantized_kv_cache:
+        raise ValueError(
+            "The direct external linker does not support MHA scale buffers."
+        )
+    if mtp_draft_device_pools:
+        raise ValueError("The direct external linker does not support MHA draft pools.")
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "MHA KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+
+    entry = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=kvcache,
+        components=[kvcache.k_buffer, kvcache.v_buffer],
+        layer_mapping={layer: layer for layer in range(kvcache.layer_num)},
+        page_size=page_size,
+        rows_are_pages=kvcache._kv_tokens_per_row() == page_size,
+    )
+    return DevicePoolGroup([entry], kvcache.layer_num, page_size)
 
 
 def resolve_hybrid_device_pool_group(
