@@ -1029,27 +1029,56 @@ class TestKVCRDirectLinker(CustomTestCase):
             KVCRDirectLinker,
         )
 
-        def peer_differs(digests, digest, group=None):
-            digests[0], digests[1] = digest, b"peer"
+        def peer_lower(bounds, op=None, group=None):
+            bounds[0] -= 1
 
-        for shard, queued in ((True, ["load"]), (True, []), (False, ["load"])):
-            linker = SimpleNamespace(
-                _queued=[SimpleNamespace(rid=r, plan=()) for r in queued],
-                _tp_group=None,
-                _shard=shard,
-            )
-            with (
-                self.subTest(shard=shard, queued=queued),
-                patch.object(torch.distributed, "get_world_size", return_value=2),
-                patch.object(
-                    torch.distributed, "all_gather_object", side_effect=peer_differs
-                ),
-            ):
-                if shard:
-                    with self.assertRaisesRegex(RuntimeError, "sharded storage"):
-                        KVCRDirectLinker._prepare_gather(linker)
-                else:
-                    self.assertIsNone(KVCRDirectLinker._prepare_gather(linker))
+        def peer_higher(bounds, op=None, group=None):
+            bounds[1] -= 1
+
+        for shard in (True, False):
+            for peer in (peer_lower, peer_higher):
+                linker = SimpleNamespace(
+                    _queued=[SimpleNamespace(rid="load", plan=())],
+                    _tp_group=None,
+                    _shard=shard,
+                )
+                with (
+                    self.subTest(shard=shard, peer=peer.__name__),
+                    patch.object(torch.distributed, "all_reduce", side_effect=peer),
+                ):
+                    if shard:
+                        with self.assertRaisesRegex(RuntimeError, "sharded storage"):
+                            KVCRDirectLinker._prepare_gather(linker)
+                    else:
+                        self.assertIsNone(KVCRDirectLinker._prepare_gather(linker))
+
+    def test_agreed_plan_prepares_the_gather(self):
+        from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
+            KVCRDirectLinker,
+        )
+
+        gather = SimpleNamespace(prepare=lambda slots, owners: (slots, owners))
+        linker = SimpleNamespace(
+            _queued=[SimpleNamespace(rid="load", plan=(), slots={})],
+            _tp_group=None,
+            _shard=True,
+            _gather=gather,
+        )
+        with patch.object(torch.distributed, "all_reduce") as all_reduce:
+            self.assertEqual(KVCRDirectLinker._prepare_gather(linker), ({}, {}))
+        self.assertEqual(all_reduce.call_count, 1)
+
+    def test_empty_queue_start_skips_the_plan_check(self):
+        """Every rank sees the same empty queue, so no rank joins a collective."""
+        with (
+            patch.object(self.linker, "_gather", SimpleNamespace()),
+            patch.object(torch.distributed, "all_reduce") as all_reduce,
+            patch.object(torch.distributed, "all_gather_object") as all_gather,
+        ):
+            self.assertEqual(self.linker.start_layer_wise_loading(), -1)
+        all_reduce.assert_not_called()
+        all_gather.assert_not_called()
+        self.assertEqual(self.client.calls, [])
 
     def test_unaddressed_remote_shard_hints_do_not_admit_failed_deliveries(self):
         from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (

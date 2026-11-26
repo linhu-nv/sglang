@@ -732,9 +732,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if self._fatal is not None:
             raise self._fatal
         # Synchronous load/start/reset calls keep this queue visible to the scheduler.
-        gather = self._prepare_gather() if self._gather is not None else None
+        # Queueing depends on the transfers alone, so every rank sees the same
+        # emptiness and skips the plan check together.
         if not self._queued:
             return -1
+        gather = self._prepare_gather() if self._gather is not None else None
         self._freeze_gc_once()
         ready = self._record_ready()
         index = self._call(self._start, ready, gather is not None)
@@ -744,15 +746,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def _prepare_gather(self):
         # Ranks may adopt different slots but must load the same pages in the
-        # same order; every rank takes part, empty batches included.
+        # same order.
         queued = tuple(self._queued)
         digest = hashlib.sha256(
             repr([(load.rid, load.plan) for load in queued]).encode()
         ).digest()
-        digests = [None] * torch.distributed.get_world_size(self._tp_group)
-        torch.distributed.all_gather_object(digests, digest, group=self._tp_group)
-        # Checked before the empty-queue return so every rank takes the same path.
-        if any(other != digest for other in digests):
+        # MIN of (v, -v) equals (v, -v) only if every rank holds the same v.
+        value = int.from_bytes(digest[:7], "little")
+        bounds = torch.tensor([value, -value], dtype=torch.int64)
+        torch.distributed.all_reduce(
+            bounds, op=torch.distributed.ReduceOp.MIN, group=self._tp_group
+        )
+        if int(bounds[0]) != value or -int(bounds[1]) != value:
             if self._shard:
                 # Sharded sources hold only their own pages; all-rank reads would miss.
                 raise RuntimeError(
@@ -760,8 +765,6 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     "all-rank reads cannot recover from sharded storage"
                 )
             logger.warning("KVCR load plans differ across ranks; all ranks read")
-            return None
-        if not queued:
             return None
         slots, owners = {}, {}
         for load in queued:
